@@ -219,12 +219,17 @@ With the packed K-quant path as the weight path,
 tests/gguf_vulkan tests/kernel/vulkan -q` -> **120 passed, 5 skipped in
 414-465 s** (2026-10-21, defaults as shipped: `FTV_GGUF_BATCHED=1`,
 `FTV_EXP_CACHE_MB=2048`); the 5 skips are the safetensors/gpt-oss checkpoint
-gates whose checkpoints are not on this machine. After the engine fix and
-the shared MoE batch landed (section 7), the re-runs were `tests/vulkan/test_mtp.py`
-**6 passed**, `tests/vulkan` **32 passed, 4 skipped in 501 s**,
-`tests/kernel/vulkan` **32 passed** (with the model env), and
-`test_batched_fork2.py` **2 passed, 1 skipped**. The A/B numbers in section 7
-were taken with `tests/vulkan/bench_mtp.py`, which is the same code path.
+gates whose checkpoints are not on this machine. The closeout re-run after
+the power cycle (2026-10-21 evening, page cache deliberately warmed, shipped
+defaults): `tests/vulkan/test_mtp.py` **6 passed in 60.7 s** (walk parity
+walk-walk **0.0**, walk-vs-chained-`decode_step_batched` **0.0**,
+walk-vs-sequential **9.775e-06** with the shared accumulator, identity 3/3,
+skip-KV identity green), `tests/vulkan` **32 passed, 4 skipped in 551.7 s**,
+`tests/kernel/vulkan` **32 passed in 21.9 s**, and the CLI reference
+`"Name three primary colors." --max-tokens 4 --temperature 0 --seed 1234`
+returns **`[5844, 11, 13358, 11]` on both arms** (with and without `--mtp
+--mtp-n-max 3 --mtp-p-min 0.25`). The A/B numbers in section 7 were taken
+with `tests/vulkan/bench_mtp.py`, which is the same code path.
 
 ## 7. Measured results (RX 5700 XT, RADV, CyberTiel GGUF, batch 1)
 
@@ -407,66 +412,98 @@ CLI identity (`[5844, 11, 13358, 11]` with and without `--mtp --mtp-p-min
 0.25 --mtp-n-max 3`) unchanged; `tests/vulkan/test_mtp.py` **6 passed**,
 `tests/vulkan` **32 passed / 4 skipped**.
 
-`bench_mtp.py` (interleaved arms, median of 3 rounds, 32 tokens, `--n-max 3
---p-min 0.25`, shipped env defaults `FTV_EXP_CACHE_MB=2048` /
-`FTV_HOST_PACK_MB=256`, run twice this session - loaded box at the start,
-calm at the end, so both medians are quoted):
+`bench_mtp.py` - final closeout numbers (interleaved arms, median of 3
+rounds, 32 tokens, `--n-max 3 --p-min 0.25`, shipped env defaults
+`FTV_EXP_CACHE_MB=2048` / `FTV_HOST_PACK_MB=256`). Two sessions after the
+power cycle, both quoted because the box is shared: session A (18:33, after
+a deliberate 3-pass `cat` of the 22 GB GGUF - Cached 10.9 -> ~18 GiB, the
+file cannot fully fit alongside running apps so the warm is partial; load
+4.2-6.6, swap 1.6-1.9 GiB, Cached ~14.7-15.0 GiB) and session B (19:00,
+both snapshot variants run back to back in one shell; load 0.8 -> 4.8, swap
+4.7 GiB pushed up by other tenants, Cached 12.9 -> 10.9 GiB declining
+through the run). RSS max 14.1-14.3 GB; resident 6416 MiB (VRAM end
+7.1-7.8 GiB whole-GPU including other tenants); round trips counted with
+`bench_gguf_packed.py`'s `_SYNC_KEYS` (sync submit+fence ops via
+`model.stat_calls`):
 
-| arm | wall ms/tok | tok/s | decode-only ms/tok | identity | accept | passes/tok | rows/tok |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| baseline (`batched=True`) | 173.9-177.1 | 5.65-5.75 | 99.4-102.1 (9.79-10.06 tok/s) | - | - | 1.000 | 1.000 |
-| MTP `n_max=3 p_min=0.25` | 305.0-313.5 | 3.19-3.28 | 226.6-231.9 (4.31-4.41 tok/s) | **3/3** | 0.69 | 0.564 | 1.312 |
+| arm | wall ms/tok | tok/s | decode ms/tok (tok/s) | identity | accept | passes/tok | rows/tok | submits/round | rt/tok | snapshot |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| baseline (`batched=True`) | 170.2-177.7 | 5.63-5.88 | 100.7-105.7 (9.46-9.93) | - | - | 1.000 | 1.000 | 2913 (91.0/tok) | 769.5 | - |
+| MTP `n_max=3 p_min=0.25` (default snapshot) | 298.1-314.2 | 3.18-3.35 | 221.2-232.4 (4.30-4.52) | **3/3 both sessions** | 0.69 (20/29) | 0.564 | 1.312 | 1692 (52.9/tok) | 868.3 | 190-194 ms/round (77-79 ms/tok) |
+| MTP `FTV_MTP_SKIP_KV_SNAPSHOT=1` | 298.1-306.6 | 3.26-3.35 | 221.2-226.5 (4.41-4.52) | **3/3 both sessions** | 0.69 | 0.564 | 1.312 | 1692 (52.9/tok) | 868.3 | 184-187 ms/round (75 ms/tok) |
 
 MTP is **2.9x faster than on the old sequential T>1 lane** (868.9 ->
-305-314 ms/tok) but still measures **0.56x the baseline** - and the shared
-batch did not move the wall clock (305.3 before, 305.0/313.5 after). The
-phase stats (now including the snapshot) say exactly where the time goes,
-last run: prefill 2613, draft 321, verify 3805, catch-up 332, rollback 432,
-snapshot 2508 ms for 32 tokens / 13 rounds:
+298-314 ms/tok) but still measures **0.57-0.58x wall / 0.44-0.46x decode**
+of the baseline - on both snapshot variants. Phase stats per 32-token run
+(session A default: prefill 2404, draft 304, verify 3597, catch-up 320,
+rollback 423, snapshot 2464; session B default: 2590 / 317 / 3753 / 328 /
+429 / 2526), i.e. per token: draft 9.5-9.9 + verify 112.4-117.3 +
+catch-up 10.0-10.3 + rollback 13.2-13.4 + snapshot 77.0-78.9 = 222-230 vs
+the measured decode-only 226-232 (the remainder is lm_head/sampling).
 
 1. **Rows, not passes, are the unit.** At accept 0.69 a round commits
    `accepted + 1` tokens from `drafted + 1` rows: 42 verify rows for 32
    tokens = **1.31 rows/token**. `passes/token` 0.564 counts a T-row verify
    as one pass and overstates the saving.
-2. **Verify costs 90.6 ms/row (3805/42), 0.89x the baseline token
-   (102.1).** The walk's batching works - the bench's own probe agrees
-   (89.4 ms/row at T=8 vs 235 ms/row sequential) - but the per-row saving is
-   only ~11%, so 1.31 rows/token turns 102 into ~119 ms/tok. The submit
-   count is no longer the problem: the shared batch brought MTP to **52.9
+2. **Verify costs 85.6-89.4 ms/row (3597-3753/42), 0.81-0.89x the
+   baseline token (100.7-105.7).** The walk's batching works - the bench's
+   own probe agrees (84.1 ms/row at T=8 vs 223.6-231.0 ms/row sequential,
+   2.7x) - but the per-row saving is only ~11-19%, so 1.31 rows/token turns
+   ~101-106 into ~221-232. The shared MoE batch brought MTP to **52.9
    submits/token vs the baseline's 91** (1692 vs 2913 per run; the walk
    itself is 30 GDN + 20 attention + 40 MoE = **90 submits per verify round
-   regardless of T**, plus draft/catch-up/rollback walks). The wall clock
-   not moving despite halving the submits is the measurement that falsified
-   the earlier "the MoE submits were the tax" reading: those fence waits were
-   GPU-work attribution, and batching them only moved where the same work
-   gets accounted.
-3. **`snapshot` is ~193 ms per round (78 ms/tok), now timed** as
-   `ms_snapshot` in the phase stats. Decomposed with probe scripts: the
-   GDN/conv pull-down is **186 ms**, the host KV copies only **6 ms**. The
-   pull-down is linear in bytes (6.1 ms per 2 MiB -> 177 ms per 60 MiB, ~333
-   MB/s): a CPU `memcpy` out of WC BAR memory - `make_host_ssbo` requests
+   regardless of T**, plus draft/catch-up/rollback walks), yet the wall
+   clock did not move (305.3 before the shared batch, 298-314 after): those
+   fence waits were GPU-work attribution, not the tax.
+3. **Fewer submits, MORE sync round trips.** The `stat_calls` counter
+   (sync submit+fence ops: `_pinned_affine` x3 per call, batch variants
+   x2, expert io) measures MTP at **868.3 rt/tok vs the baseline's
+   769.5** - MTP's extra host sync work (lm_head per draft step, catch-up,
+   rollback re-verify, embed) more than cancels the submit savings. The
+   round trips are deterministic (identical across every round of every
+   run).
+4. **`snapshot` is 190-194 ms per round (77-79 ms/tok)** - 68-78% of a
+   whole baseline token spent before any drafting shows up - timed as
+   `ms_snapshot`. Decomposed with probe scripts: the GDN/conv pull-down is
+   **186 ms**, the host KV copies only **6 ms**. The pull-down is linear in
+   bytes (6.1 ms per 2 MiB -> 177 ms per 60 MiB, ~333 MB/s): a CPU
+   `memcpy` out of WC BAR memory - `make_host_ssbo` requests
    `HOST_VISIBLE` only, so `vku::download` reads mapped GPU memory at PCIe
    read speed. That fix is kernel-lane territory: `HOST_CACHED` download
    staging (or a D2D snapshot op that keeps the copy on the GPU) would cut
-   it to milliseconds. What is in THIS lane is the KV half, which is sound
-   to drop (cells past the post-rollback position are never read before a
-   later round overwrites them, section 3) - and it is opt-in:
-   `FTV_MTP_SKIP_KV_SNAPSHOT=1` skips it, measured **193 -> 186 ms/round**
-   (it was only 6 ms), gated by `test_mtp_skip_kv_snapshot_identity`.
+   it to milliseconds.
+5. **`FTV_MTP_SKIP_KV_SNAPSHOT=1` (opt-in) removes the 6 ms KV half and
+   CHANGES ROLLBACK SEMANTICS.** Measured gain: 190-194 -> 184-187
+   ms/round (~2.6 ms/tok of snapshot; decode medians 226.3 -> 221.2 and
+   232.4 -> 226.5 ms/tok), identity **3/3 in both sessions** and green in
+   `test_mtp_skip_kv_snapshot_identity` - so it does not break tokens.
+   The semantic difference: with the flag, `MtpHead.restore()` puts back
+   only the GDN state and conv history; the trunk KV is NOT restored, so
+   rejected rows' KV cells past the rollback position keep their **stale
+   draft content** instead of the pre-verify values. That is sound today
+   only by the unread-cells argument (section 3: every KV cell is written
+   before it is read - queries attend only `<=` their own position, and a
+   later round overwrites the stale cells before they can be read), so a
+   future change that read those cells would silently diverge from the
+   full-copy path. It stays **opt-in** for exactly that reason; the default
+   keeps the full-copy rollback it shipped with.
 
-**Win condition, honestly stated (measured, not projected).** The decode-only
-arithmetic: verify (1.31 rows x 90.6 = 119) + snapshot (78) + draft/catch-up/
-rollback (34) = 231.9 ms/tok against the baseline's 102.1. Removing the
-snapshot entirely (kernel fix) still leaves ~154 (0.66x); perfect accept
-(1.0 row/token) without it still leaves ~124 (0.83x). Break-even needs
-**both** levers that live outside this lane: (a) the snapshot pull-down fixed
-kernel-side (-78 ms/tok), and (b) per-row verify cost from 90.6 down to
+**Win condition, honestly stated (measured, not projected).** The
+decode-only arithmetic: verify (1.31 rows x 85.6-89.4 = 112-117) +
+snapshot (77-79) + draft/catch-up/rollback (32.7) = 221-232 ms/tok against
+the baseline's 100.7-105.7. Removing the snapshot entirely (kernel fix)
+still leaves ~145-150 (0.69-0.71x); perfect accept (1.0 row/token) without
+it still leaves ~118 (0.87x). Break-even needs **both** levers that live
+outside this lane: (a) the snapshot pull-down fixed kernel-side
+(-77 to -79 ms/tok), and (b) per-row verify cost from 85.6-89.4 down to
 ~52 ms (-40%, cross-row expert-weight amortization in the MoE GEMM - the
-M>1 row direction), with any accept-rate gain on top. The algorithm itself
-measures healthy: accept 0.69, identity 3/3, fewer submits/token than the
-non-speculative baseline. Until those two land, `--mtp` is token-identical
-and correct but still slower than not drafting - use it for correctness
-work, not speed; the numbers live here.
+M>1 row direction), with any accept-rate gain on top; the skip-KV flag's
+6-7 ms/round does not change this picture. The algorithm itself measures
+healthy: accept 0.69, identity 3/3 on every arm, fewer command-buffer
+submits/token than the non-speculative baseline (52.9 vs 91). Until those
+two levers land, `--mtp` is token-identical and correct but still slower
+than not drafting - use it for correctness work, not speed; the numbers
+live here.
 
 
 ## 8. Known limits / follow-ups
@@ -495,9 +532,11 @@ work, not speed; the numbers live here.
   T>1 lane) and the batched walk `decode_rows_batched` fixed it - and the
   engine hazard fix (commit 5425148) then let the MoE phase collapse to one
   shared batch (52.9 vs 91 submits/token, section 7). MTP still measures
-  0.56x the baseline because two costs dominate instead: 1.31 rows/token at
-  0.69 accept x 90.6 ms/row, plus the 193 ms/round rollback snapshot whose
-  GDN pull-down reads WC staging memory at ~333 MB/s. The next levers are
-  the kernel's download-staging mode (HOST_CACHED or a D2D snapshot op) and
-  per-row verify cost (the M>1 row direction), not the draft/verify/accept
-  logic.
+  **0.57-0.58x the baseline after the closeout run** because two costs
+  dominate instead: 1.31 rows/token at 0.69 accept x 85.6-89.4 ms/row, plus
+  the 190-194 ms/round rollback snapshot whose GDN pull-down reads WC
+  staging memory at ~333 MB/s (the skip-KV flag only removes its 6 ms KV
+  half, and stays opt-in because it changes rollback semantics - section 7).
+  The next levers are the kernel's download-staging mode (HOST_CACHED or a
+  D2D snapshot op) and per-row verify cost (the M>1 row direction), not the
+  draft/verify/accept logic.

@@ -166,19 +166,30 @@ submit/fence overhead, not the weights (see
 [kquant-kernels.md](kquant-kernels.md)).
 
 **MTP speculative decode is token-identical but still slower than not
-drafting.** `--mtp --mtp-p-min 0.25 --mtp-n-max 3` stays token-identical to
-the non-speculative greedy path with `FTV_GGUF_BATCHED=1`. Its verify runs
-the batched multi-row walk (`decode_rows_batched`) with one shared MoE batch
-for all verify rows now that the engine's mid-batch descriptor-bug is fixed
-(commit 5425148) - 52.9 submits/token vs the baseline's 91, verify 90.6
-ms/row = 0.89x a baseline token - which still measures **0.56x** of the
-batched baseline (3.19-3.28 vs 5.65-5.75 tok/s, median of 3 interleaved
-rounds, identity 3/3): a round verifies `drafted + 1` rows (1.31 rows/token
-at 0.69 accept) and the rollback snapshot adds ~193 ms/round, of which 186
-ms is a GDN pull-down that reads WC staging at ~333 MB/s (kernel-lane fix;
-`FTV_MTP_SKIP_KV_SNAPSHOT=1` drops the 6 ms KV half). Use it for
-correctness work, not speed; the win condition and the measured numbers are
-in [mtp.md](mtp.md).
+drafting (final closeout, 2026-10-21).** `--mtp --mtp-p-min 0.25
+--mtp-n-max 3` stays token-identical to the non-speculative greedy path
+with `FTV_GGUF_BATCHED=1`: identity 3/3 in every round of both bench
+sessions and both snapshot variants, the walk-parity gate bit-exact
+(walk-walk 0.0, walk-vs-chained 0.0, walk-vs-sequential 9.775e-06), and
+the CLI reference `[5844, 11, 13358, 11]` on both arms. Its verify runs the
+batched multi-row walk (`decode_rows_batched`) with one shared MoE batch
+for all verify rows now that the engine's mid-batch descriptor bug is fixed
+(commit 5425148) - 52.9 submits/token vs the baseline's 91, verify
+85.6-89.4 ms/row - but it still measures **0.57-0.58x wall / 0.44-0.46x
+decode** of the baseline (medians of 3 interleaved rounds, both snapshot
+variants run back to back; baseline 170.2-177.7 ms/tok wall, MTP
+298.1-314.2; decode-only 100.7-105.7 vs 221.2-232.4). The residual: a
+round verifies `drafted + 1` rows (1.31 rows/token at 0.69 accept) and the
+rollback snapshot adds 190-194 ms/round (77-79 ms/tok), of which 186 ms is
+a GDN pull-down that reads WC staging at ~333 MB/s (kernel-lane fix;
+fewer submits but MORE sync round trips: 868.3 vs 769.5 rt/tok).
+`FTV_MTP_SKIP_KV_SNAPSHOT=1` drops the 6 ms KV half (measured 190-194 ->
+184-187 ms/round, identity still 3/3) but **changes rollback semantics**
+(rollback no longer restores trunk KV; sound only by the unread-cells
+argument), so it stays opt-in. Win condition: snapshot pull-down fixed
+kernel-side AND per-row verify 85.6 -> ~52 ms (cross-row expert
+amortization), with accept-rate headroom on top. Use it for correctness
+work, not speed; the measured numbers are in [mtp.md](mtp.md).
 
 ### Environment knobs
 
@@ -197,6 +208,8 @@ in [mtp.md](mtp.md).
 | `FTV_GPU_ROUTER` | run the router and top-k on the GPU |
 | `FTV_EXP_ARENA` | fixed-slot per-layer expert arena (fused 8-expert MoE dispatch; NVFP4-packed only, forced off for GGUF) |
 | `FTV_SPEC_PACK` | speculative host pre-pack daemon for the next token's experts (NVFP4-packed only, forced off for GGUF) |
+| `FTV_MTP_BATCHED` | `1` (default) run the MTP draft/verify/catch-up on the batched multi-row walk, `0` force the sequential chunk lane |
+| `FTV_MTP_SKIP_KV_SNAPSHOT` | `0` (default) full-copy rollback snapshot; `1` (opt-in) skip the trunk-KV half - measured only 6-7 ms/round faster but **changes rollback semantics** (rollback restores GDN/conv only; rejected rows' KV cells keep stale content, sound only by the unread-cells argument), see [mtp.md](mtp.md) |
 
 ## Hardware notes (RDNA1 / gfx1010)
 

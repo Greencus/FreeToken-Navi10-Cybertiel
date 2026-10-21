@@ -22,8 +22,8 @@ Measurement rules (benchmarks lie on a loaded box):
 - ``/proc/meminfo`` (Cached, swap-in-use), VRAM used and loadavg are
   printed at start and end - a run with swap climbing or a loaded box is
   flagged, not averaged over;
-- native counter deltas per token (submits, record barriers, queue-2
-  submits) separate structural cost from wall-clock noise.
+- native counter deltas per token (sync round trips, submits, record
+  barriers, queue-2 submits) separate structural cost from wall-clock noise.
 """
 from __future__ import annotations
 
@@ -81,22 +81,37 @@ def _env_line(tag: str) -> str:
     )
 
 
+# Sync (submit_and_wait) op keys, the same set bench_gguf_packed.py counts
+# as host<->GPU round trips - the batched lanes bump pin_batch_*/exp_batch_*,
+# the sequential lanes pin_*/exp_*.
+_SYNC_KEYS = (
+    "pin_up", "pin_kernel", "pin_down",
+    "pin_batch_kernel", "pin_batch_down",
+    "exp_x", "exp_kernel", "exp_down", "exp_up",
+    "exp_batch_kernel", "exp_batch_down",
+)
+
+
+def _round_trips(stat_calls: dict) -> int:
+    return sum(stat_calls.get(k, 0) for k in _SYNC_KEYS)
+
+
 def _counters(model) -> dict[str, int]:
     ext = model.ext
     return {
         "submits": ext.batch_submit_count()[0],
         "barriers": ext.batch_barrier_stats()[0],
         "q2": ext.batch_upload_async_stats()[0],
+        "rt": _round_trips(model.stat_calls),
     }
-
-
-def _submits_delta(c0: dict, c1: dict) -> int:
-    return c1["submits"] - c0["submits"]
 
 
 def _delta_str(c0: dict, c1: dict, tokens: int) -> str:
     d = lambda k: (c1[k] - c0[k]) / tokens
-    return f"submits/tok {d('submits'):.1f} barriers/tok {d('barriers'):.1f} q2/tok {d('q2'):.1f}"
+    return (
+        f"submits/tok {d('submits'):.1f} rt/tok {d('rt'):.1f} "
+        f"barriers/tok {d('barriers'):.1f} q2/tok {d('q2'):.1f}"
+    )
 
 
 def _timed_generate(model, tokens, warmup, batched=True):
@@ -107,8 +122,10 @@ def _timed_generate(model, tokens, warmup, batched=True):
     t0 = time.perf_counter()
     out = model.generate(PROMPT, max_new=tokens, temperature=0.0,
                          prefill_chunk=64, batched=batched)
-    submits = _submits_delta(c0, _counters(model))
-    return out, time.perf_counter() - t0, _delta_str(c0, _counters(model), tokens), submits
+    c1 = _counters(model)
+    rt = c1["rt"] - c0["rt"]
+    return (out, time.perf_counter() - t0, _delta_str(c0, c1, tokens),
+            c1["submits"] - c0["submits"], rt)
 
 
 def _timed_mtp(model, tokens, warmup, n_max, p_min):
@@ -119,8 +136,9 @@ def _timed_mtp(model, tokens, warmup, n_max, p_min):
     out = generate_mtp(model, PROMPT, max_new=tokens, n_max=n_max, p_min=p_min)
     wall = time.perf_counter() - t0
     st = dict(model.mtp.stats)
-    submits = _submits_delta(c0, _counters(model))
-    return out, wall, st, _delta_str(c0, _counters(model), tokens), submits
+    c1 = _counters(model)
+    return (out, wall, st, _delta_str(c0, c1, tokens),
+            c1["submits"] - c0["submits"], c1["rt"] - c0["rt"])
 
 
 def _timed_prefill(model) -> float:
@@ -236,32 +254,36 @@ def main() -> int:
     base_dec: list[float] = []
     base_tokens: list[list[int]] = []
     base_submits: list[int] = []
+    base_rt: list[int] = []
     mtp_wall: dict[float, list[float]] = {p: [] for p in p_mins}
     mtp_dec: dict[float, list[float]] = {p: [] for p in p_mins}
     mtp_ident: dict[float, int] = {p: 0 for p in p_mins}
     mtp_last_st: dict[float, dict] = {p: {} for p in p_mins}
     mtp_submits: dict[float, list[int]] = {p: [] for p in p_mins}
+    mtp_rt: dict[float, list[int]] = {p: [] for p in p_mins}
 
     for rnd in range(1, args.rounds + 1):
-        bt, b_wall, b_cnt, b_sub = _timed_generate(model, args.tokens, 0)
+        bt, b_wall, b_cnt, b_sub, b_rtrip = _timed_generate(model, args.tokens, 0)
         base_wall.append(b_wall)
         base_dec.append(max(0.0, b_wall - base_prefill_s))
         base_tokens.append(bt)
         base_submits.append(b_sub)
+        base_rt.append(b_rtrip)
         print(
             f"round {rnd} base   {args.tokens}tok {b_wall:.2f}s "
             f"{b_wall / args.tokens * 1e3:.1f}ms/tok "
             f"decode-only {base_dec[-1] / args.tokens * 1e3:.1f}ms/tok "
-            f"submits {b_sub}  {b_cnt}",
+            f"submits {b_sub} round_trips {b_rtrip}  {b_cnt}",
             flush=True,
         )
         for p in p_mins:
-            mt, m_wall, st, m_cnt, m_sub = _timed_mtp(
+            mt, m_wall, st, m_cnt, m_sub, m_rtrip = _timed_mtp(
                 model, args.tokens, 0, args.n_max, p)
             ident = mt == bt
             mtp_ident[p] += int(ident)
             mtp_wall[p].append(m_wall)
             mtp_submits[p].append(m_sub)
+            mtp_rt[p].append(m_rtrip)
             dec = max(0.0, m_wall - st.get("ms_prefill", 0.0) / 1e3)
             mtp_dec[p].append(dec)
             mtp_last_st[p] = st
@@ -273,7 +295,8 @@ def main() -> int:
                 f"{m_wall / args.tokens * 1e3:.1f}ms/tok "
                 f"decode-only {dec / args.tokens * 1e3:.1f}ms/tok  "
                 f"accept {accepted}/{drafted}={rate:.2f}  "
-                f"rows/tok {rows / args.tokens:.3f} submits {m_sub}  {m_cnt}  "
+                f"rows/tok {rows / args.tokens:.3f} submits {m_sub} "
+                f"round_trips {m_rtrip}  {m_cnt}  "
                 f"{'IDENTICAL' if ident else 'DIVERGED'}",
                 flush=True,
             )
@@ -285,7 +308,9 @@ def main() -> int:
         f"({args.tokens / med_base_w:.2f} tok/s)  decode-only "
         f"{med_base_d / args.tokens * 1e3:.1f}ms/tok "
         f"({args.tokens / med_base_d:.2f} tok/s)  "
-        f"submits/round {statistics.median(base_submits):.0f}",
+        f"submits/round {statistics.median(base_submits):.0f} "
+        f"rt/round {statistics.median(base_rt):.0f} "
+        f"rt/tok {statistics.median(base_rt) / args.tokens:.1f}",
         flush=True,
     )
     for p in p_mins:
@@ -307,7 +332,9 @@ def main() -> int:
             f"identity {mtp_ident[p]}/{args.rounds}  "
             f"passes/tok {passes / args.tokens:.3f}  "
             f"rows/tok {rows / args.tokens:.3f}  "
-            f"submits/round {statistics.median(mtp_submits[p]):.0f}",
+            f"submits/round {statistics.median(mtp_submits[p]):.0f} "
+            f"rt/round {statistics.median(mtp_rt[p]):.0f} "
+            f"rt/tok {statistics.median(mtp_rt[p]) / args.tokens:.1f}",
             flush=True,
         )
         print(
