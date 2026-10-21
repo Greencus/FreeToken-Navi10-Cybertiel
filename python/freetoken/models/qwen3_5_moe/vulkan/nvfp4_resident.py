@@ -3016,24 +3016,25 @@ class ResidentNVFP4(ResidentQwen35):
                 )
                 for t in range(T)
             ]
-            # One submit per row, not one batch for all T: rows sharing
-            # h_y_acc in a single command buffer made the acc readbacks
-            # all-NaN on this engine build (hazard-ordering gap in the
-            # engine, reproduced on this hardware); per-row is exactly
-            # decode_step_batched's proven shape.
+            # One command buffer for all T rows, like the GDN phase: row
+            # t+1's upload/fill/record hazard-order after row t's downloads
+            # and dispatches on the shared h_x_fused/h_y_acc/silu slots.
+            # (Rows sharing h_y_acc once read back all-NaN here - the engine
+            # destroyed buffers and reset the descriptor pool mid-batch;
+            # fixed by deferring both to batch drain, commit 5425148.)
             acc_rows: list[torch.Tensor] = []
             sd_rows: list[torch.Tensor] = []
             gsc_rows: list[torch.Tensor] = []
+            ext.batch_begin()
             for t in range(T):
-                ext.batch_begin()
                 ext.batch_upload(
                     self.h_x_fused, h2_rows[t].contiguous().float())
                 ext.batch_fill(self.h_y_acc, 0.0, cfg.hidden_size)
                 acc_t, sd_t, gsc_t = self._record_moe_in(i, h2_rows[t], ext)
-                ext.batch_submit()
                 acc_rows.append(acc_t)
                 sd_rows.append(sd_t)
                 gsc_rows.append(gsc_t)
+            ext.batch_submit()
             x_rows = (
                 torch.stack(x1_rows) + torch.stack(acc_rows)
                 + torch.sigmoid(torch.stack(gsc_rows)) * torch.stack(sd_rows)

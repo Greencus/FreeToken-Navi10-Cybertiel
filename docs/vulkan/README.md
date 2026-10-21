@@ -167,17 +167,18 @@ submit/fence overhead, not the weights (see
 
 **MTP speculative decode is token-identical but still slower than not
 drafting.** `--mtp --mtp-p-min 0.25 --mtp-n-max 3` stays token-identical to
-the non-speculative greedy path with `FTV_GGUF_BATCHED=1`. Its verify now
-runs the batched multi-row walk (`decode_rows_batched`, one command buffer
-per layer phase for all verify rows), which took it from 0.34x to **0.56x**
-of the batched baseline (3.28 vs 5.88 tok/s, median of 3 interleaved
-rounds, identity 3/3) - verify costs ~1.07x a baseline token per row, but a
-round verifies `drafted + 1` rows to commit `accepted + 1` tokens, the
-MoE phase must submit per row (an engine multi-row hazard bug, see
-[mtp.md](mtp.md)), and the rollback snapshot adds ~190 ms/round. Use it
-for correctness work, not speed, until the engine's multi-row MoE batch is
-fixed; the win condition and the measured numbers are in
-[mtp.md](mtp.md).
+the non-speculative greedy path with `FTV_GGUF_BATCHED=1`. Its verify runs
+the batched multi-row walk (`decode_rows_batched`) with one shared MoE batch
+for all verify rows now that the engine's mid-batch descriptor-bug is fixed
+(commit 5425148) - 52.9 submits/token vs the baseline's 91, verify 90.6
+ms/row = 0.89x a baseline token - which still measures **0.56x** of the
+batched baseline (3.19-3.28 vs 5.65-5.75 tok/s, median of 3 interleaved
+rounds, identity 3/3): a round verifies `drafted + 1` rows (1.31 rows/token
+at 0.69 accept) and the rollback snapshot adds ~193 ms/round, of which 186
+ms is a GDN pull-down that reads WC staging at ~333 MB/s (kernel-lane fix;
+`FTV_MTP_SKIP_KV_SNAPSHOT=1` drops the 6 ms KV half). Use it for
+correctness work, not speed; the win condition and the measured numbers are
+in [mtp.md](mtp.md).
 
 ### Environment knobs
 

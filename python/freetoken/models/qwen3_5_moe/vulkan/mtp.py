@@ -167,6 +167,18 @@ class MtpHead:
             and os.environ.get("FTV_MTP_BATCHED", "1").strip() != "0"
         )
 
+        # Rollback-snapshot optimization, opt-in (FTV_MTP_SKIP_KV_SNAPSHOT=1):
+        # snapshot/restore skip the trunk KV host copies. Sound because every
+        # KV read is preceded by a write of the same cell in the same row
+        # (_full_attn_host writes k_cache[i][pos] before reading [:pos+1]),
+        # so the rejected rows' cells past pos+n_acc are never read before a
+        # later round overwrites them. Default 0 = the full-copy semantics
+        # this head shipped with (identical tokens either way; the gate
+        # asserts that).
+        self._skip_kv_snap = (
+            os.environ.get("FTV_MTP_SKIP_KV_SNAPSHOT", "0").strip() != "0"
+        )
+
         # Admit blk.40's dense names to the provider, then pin them with the
         # GGUF decoder's own helpers. _fetch already knows every leaf below,
         # so no provider change is needed - only the name set grows. The
@@ -223,12 +235,17 @@ class MtpHead:
         # Trunk-state snapshot for the partial-accept rollback (~95 MB: the
         # GDN states, conv history, and the 10 full-attn KV caches). Allocated
         # once so a round's rollback does not churn the host allocator.
+        # With FTV_MTP_SKIP_KV_SNAPSHOT=1 the KV half is neither allocated
+        # nor copied (see the flag's comment above).
         self._snap = {
             "gdn": {i: torch.empty_like(t) for i, t in model.gdn_state.items()},
             "conv": {i: torch.empty_like(t) for i, t in model.conv_buf.items()},
-            "k": {i: torch.empty_like(t) for i, t in model.k_cache.items()},
-            "v": {i: torch.empty_like(t) for i, t in model.v_cache.items()},
         }
+        if not self._skip_kv_snap:
+            self._snap["k"] = {
+                i: torch.empty_like(t) for i, t in model.k_cache.items()}
+            self._snap["v"] = {
+                i: torch.empty_like(t) for i, t in model.v_cache.items()}
         self.stats: dict[str, float] = {}
         self.reset()
 
@@ -248,6 +265,7 @@ class MtpHead:
             "ms_verify": 0.0,
             "ms_catchup": 0.0,
             "ms_rollback": 0.0,
+            "ms_snapshot": 0.0,
         }
 
     @contextmanager
@@ -399,7 +417,10 @@ class MtpHead:
         (batched walk ran last) they are pulled down first - the host rows
         may be stale then, and ``restore`` always writes host -> dirty.
         The KV caches are host tensors in both lanes (attention runs on
-        host), so they are copied directly either way.
+        host), so they are copied directly either way - unless
+        ``FTV_MTP_SKIP_KV_SNAPSHOT=1`` elides the KV half (see the flag's
+        comment in ``__init__``: every KV cell is written before it is
+        read, so the copies only preserve unread garbage).
         """
         model = self.model
         if model._gdn_gpu_dirty:
@@ -417,10 +438,11 @@ class MtpHead:
                 ext.batch_download(
                     model.conv_buf_gpu[i], self._snap["conv"][i])
             ext.batch_submit()
-        for i, t in model.k_cache.items():
-            self._snap["k"][i].copy_(t)
-        for i, t in model.v_cache.items():
-            self._snap["v"][i].copy_(t)
+        if not self._skip_kv_snap:
+            for i, t in model.k_cache.items():
+                self._snap["k"][i].copy_(t)
+            for i, t in model.v_cache.items():
+                self._snap["v"][i].copy_(t)
 
     def restore(self) -> None:
         """Put the trunk back to the last snapshot."""
@@ -429,10 +451,11 @@ class MtpHead:
             model.gdn_state[i].copy_(t)
         for i, t in self._snap["conv"].items():
             model.conv_buf[i].copy_(t)
-        for i, t in self._snap["k"].items():
-            model.k_cache[i].copy_(t)
-        for i, t in self._snap["v"].items():
-            model.v_cache[i].copy_(t)
+        if not self._skip_kv_snap:
+            for i, t in self._snap["k"].items():
+                model.k_cache[i].copy_(t)
+            for i, t in self._snap["v"].items():
+                model.v_cache[i].copy_(t)
         model._gdn_gpu_dirty = True
 
     # -- draft -----------------------------------------------------------
@@ -648,7 +671,9 @@ def generate_mtp(
         verify_ids = [pending_id, *drafts]
         m = len(verify_ids)
 
+        t0 = time.perf_counter()
         head.snapshot()
+        head.stats["ms_snapshot"] += (time.perf_counter() - t0) * 1e3
         t0 = time.perf_counter()
         logits_rows, h_rows_v = head.verify(pos, verify_ids)
         head.stats["ms_verify"] += (time.perf_counter() - t0) * 1e3

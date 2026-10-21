@@ -243,7 +243,8 @@ def test_mtp_identity(gguf_model):
         print(
             f"[{name}] cost ms: verify {stats['ms_verify']:.0f} "
             f"draft {stats['ms_draft']:.0f} catchup {stats['ms_catchup']:.0f} "
-            f"rollback {stats['ms_rollback']:.0f} prefill {stats['ms_prefill']:.0f}",
+            f"rollback {stats['ms_rollback']:.0f} prefill {stats['ms_prefill']:.0f} "
+            f"snapshot {stats.get('ms_snapshot', 0):.0f}",
             flush=True,
         )
         print(f"[{name}] ids {baseline}", flush=True)
@@ -254,3 +255,29 @@ def test_mtp_identity(gguf_model):
             f"  speculative  {speculative}"
         )
         assert drafted >= accepted >= 0
+
+
+def test_mtp_skip_kv_snapshot_identity(gguf_model, monkeypatch):
+    """FTV_MTP_SKIP_KV_SNAPSHOT=1 (KV-eliding rollback) stays token-identical.
+
+    The eliding snapshot skips the ~190 MB trunk-KV host copies on the
+    theory that every KV cell is written before it is read, so the copies
+    only preserve unread garbage. That theory is only as good as the tokens:
+    this gate runs one short identity with the flag on and asserts the same
+    baseline.
+    """
+    monkeypatch.setenv("FTV_MTP_SKIP_KV_SNAPSHOT", "1")
+    model = gguf_model
+    # enable_mtp is idempotent on an existing head; drop it so the flag is
+    # re-read in the constructor.
+    model.mtp = None
+    ids = PROMPTS[0][1]
+    baseline = model.generate(ids, max_new=MAX_NEW, temperature=0.0)
+    speculative = generate_mtp(
+        model, ids, max_new=MAX_NEW, n_max=3, p_min=0.0, prefill_chunk=64
+    )
+    assert model.mtp._skip_kv_snap
+    assert speculative == baseline, (
+        f"skip-KV-snapshot MTP diverged: {speculative} != {baseline}"
+    )
+    model.mtp = None  # later tests get the default (full-copy) head back
