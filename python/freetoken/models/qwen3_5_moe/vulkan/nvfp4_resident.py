@@ -712,15 +712,18 @@ class ResidentNVFP4(ResidentQwen35):
             return
         ext = self.ext
         ext.batch_begin()
+        # Fresh batch (empty hazard acc): one union copy records the same
+        # 60 sequential uploads with a single crossing; 0 barriers either way.
+        handles: list[int] = []
+        tensors: list[torch.Tensor] = []
         for i, t in enumerate(self.config.layer_types):
             if t != "linear_attention":
                 continue
-            ext.batch_upload(
-                self.gdn_state_gpu[i],
-                self.gdn_state[i].contiguous().float())
-            ext.batch_upload(
-                self.conv_buf_gpu[i],
-                self.conv_buf[i].contiguous().float())
+            handles.append(self.gdn_state_gpu[i])
+            tensors.append(self.gdn_state[i].contiguous().float())
+            handles.append(self.conv_buf_gpu[i])
+            tensors.append(self.conv_buf[i].contiguous().float())
+        ext.batch_upload_multi(handles, tensors, [0] * len(handles))
         ext.batch_submit()
         self._gdn_gpu_dirty = False
 
@@ -804,6 +807,26 @@ class ResidentNVFP4(ResidentQwen35):
         finally:
             ext.free_resident(h_x)
             ext.free_resident(h_y)
+
+    def _batch_pinned_matmul(
+        self, x_handle: int, slot: Any, y_handle: int
+    ) -> None:
+        """Record y = x @ slot^T for one pinned bf16 matrix (open batch).
+
+        Base-class pins are bf16 by construction (``_Bf16Pinned`` rejects
+        anything else), so the bf16 recorder is always right here;
+        ``GgufBatchedMixin`` overrides this with source-dtype dispatch for
+        the GGUF's fp32 pins and MRO keeps that override in front.
+        """
+        dtype = getattr(slot, "dtype", torch.bfloat16)
+        if dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"base batch recorder got a {dtype} pin; only bf16 pins "
+                "belong here (GGUF fp32 pins need GgufBatchedMixin)")
+        self.ext.batch_bf16_io(
+            x_handle, slot.handle, slot.handle, y_handle,
+            1, slot.rows, slot.cols, False,
+        )
 
     def _expert_affine(
         self, x: torch.Tensor, matrix: AffineQuantMatrix | list, expert: int
@@ -2585,8 +2608,11 @@ class ResidentNVFP4(ResidentQwen35):
             # stay on host).
             if layer_type == "linear_attention":
                 ext.batch_begin()
-                ext.batch_upload(self.h_x_fused, h.contiguous().float())
-                ext.batch_upload(self.h_x_resid, x.contiguous().float())
+                ext.batch_upload_multi(
+                    [self.h_x_fused, self.h_x_resid],
+                    [h.contiguous().float(), x.contiguous().float()],
+                    [0, 0],
+                )
                 import time as _time
                 t0 = _time.perf_counter()
                 self._record_gdn_in(i, ext, download=False)
@@ -2867,6 +2893,158 @@ class ResidentNVFP4(ResidentQwen35):
         ext.batch_download(self.h_y, logits_t)
         ext.batch_submit()
         return logits_t
+
+    def decode_rows_batched(
+        self,
+        x_rows: torch.Tensor,
+        pos: int,
+        layers: list[tuple[int, str]] | None = None,
+        final_norm: bool = True,
+    ) -> torch.Tensor:
+        """Multi-row forward on the batched recorders (the MTP walk).
+
+        All T rows of a layer phase share one command buffer, rows recorded
+        in ascending position order, so the pass costs the same ~2-3 submits
+        per layer as ONE ``decode_step_batched`` token regardless of T. Each
+        row's op sequence and host math mirror ``decode_step_batched`` exactly
+        (per-row [H] reductions, per-row host router, per-row host attention),
+        and the shared GDN recurrent buffers + scratch chain through the
+        batch's hazard barriers, so T rows in one batch are bit-identical to
+        T separate batched steps (gate: maxdiff 0.0 in both execution
+        orders). This walk leaves ``_gdn_gpu_dirty`` clear - the GPU GDN
+        mirrors are authoritative afterwards and ``snapshot`` pulls them down
+        on demand.
+
+        ``layers`` restricts the walk (the MTP block-40 draft / catch-up run
+        only that layer); ``final_norm`` off lets the caller apply its own
+        head norm. Returns [T, H] - post-final-norm hidden rows when
+        ``final_norm`` is on.
+        """
+        if self._gpu_router:
+            raise RuntimeError(
+                "decode_rows_batched: the multi-row walk has no GPU-router "
+                "lane (FTV_GPU_ROUTER=1); MTP then uses the chunk lane"
+            )
+        cfg = self.config
+        ext = self.ext
+        T = x_rows.shape[0]
+        # Same drains as decode_step_batched's token start: a faulted
+        # queue-2 upload batch must not append into this pass, then the GPU
+        # GDN mirrors catch up with host state when dirty (reset/prefill/
+        # sequential/chunk work ran last).
+        ext.batch_upload_async_drain()
+        self._sync_gdn_gpu()
+        if layers is None:
+            layers = list(enumerate(cfg.layer_types))
+        for i, layer_type in layers:
+            base = f"language_model.model.layers.{i}"
+            h_rows = [
+                self._rms(
+                    x_rows[t],
+                    self._dense(f"{base}.input_layernorm.weight"),
+                    cfg.rms_norm_eps,
+                )
+                for t in range(T)
+            ]
+            if layer_type == "linear_attention":
+                ext.batch_begin()
+                x1_rows: list[torch.Tensor] = []
+                for t in range(T):
+                    ext.batch_upload_multi(
+                        [self.h_x_fused, self.h_x_resid],
+                        [h_rows[t].contiguous().float(),
+                         x_rows[t].contiguous().float()],
+                        [0, 0],
+                    )
+                    self._record_gdn_in(i, ext, download=False)
+                    ext.batch_gdn_conv_io(
+                        self.h_qkv, self.conv_buf_gpu[i], self.gdn_taps[i],
+                        self.h_mixed, self._gdn_C)
+                    ext.batch_gdn_recur_io(
+                        self.h_mixed, self.h_z, self.h_a, self.h_b,
+                        self.gdn_alog[i], self.gdn_dtb[i], self.gdn_normw[i],
+                        self.gdn_state_gpu[i], self.h_x2,
+                        self._gdn_C, self._gdn_key_dim,
+                        cfg.linear_num_value_heads,
+                        cfg.linear_key_head_dim,
+                        cfg.linear_value_head_dim, self._gdn_rep,
+                        self._gdn_scale, 1e-6, cfg.rms_norm_eps)
+                    opt = self.pinned[_translate(
+                        f"{base}.linear_attn.out_proj")]
+                    self._batch_pinned_matmul(self.h_x2, opt, self.h_ao)
+                    ext.batch_vecadd_io(
+                        self.h_x_resid, self.h_ao, self.h_x1,
+                        cfg.hidden_size)
+                    x1_t = torch.empty(cfg.hidden_size)
+                    ext.batch_download(self.h_x1, x1_t)
+                    x1_rows.append(x1_t)
+                ext.batch_submit()
+            else:
+                # batch 1: attention in-projections for every row, one
+                # command buffer (row t+1's upload is hazard-ordered after
+                # row t's reads of the shared h_x_fused).
+                ext.batch_begin()
+                qkv_rows = []
+                for t in range(T):
+                    ext.batch_upload(self.h_x_fused, h_rows[t].contiguous().float())
+                    qkv_rows.append(self._record_attn_in(i, ext))
+                ext.batch_submit()
+                # host: KV append + SDPA per row, ascending position so
+                # each row attends the cells the rows before it wrote.
+                pre_rows = [
+                    self._full_attn_host(i, pos + t, *qkv_rows[t])
+                    for t in range(T)
+                ]
+                # batch 2: out_proj + readback per row.
+                ext.batch_begin()
+                opt = self.pinned[_translate(f"{base}.self_attn.o_proj")]
+                ao_rows = []
+                for t in range(T):
+                    ext.batch_upload(
+                        self.h_x2, pre_rows[t].contiguous().float())
+                    ao_t = torch.empty(opt.rows)
+                    self._batch_pinned_matmul(self.h_x2, opt, self.h_ao)
+                    ext.batch_download(self.h_ao, ao_t)
+                    ao_rows.append(ao_t)
+                ext.batch_submit()
+                x1_rows = [x_rows[t] + ao_rows[t] for t in range(T)]
+            h2_rows = [
+                self._rms(
+                    x1_rows[t],
+                    self._dense(f"{base}.post_attention_layernorm.weight"),
+                    cfg.rms_norm_eps,
+                )
+                for t in range(T)
+            ]
+            # One submit per row, not one batch for all T: rows sharing
+            # h_y_acc in a single command buffer made the acc readbacks
+            # all-NaN on this engine build (hazard-ordering gap in the
+            # engine, reproduced on this hardware); per-row is exactly
+            # decode_step_batched's proven shape.
+            acc_rows: list[torch.Tensor] = []
+            sd_rows: list[torch.Tensor] = []
+            gsc_rows: list[torch.Tensor] = []
+            for t in range(T):
+                ext.batch_begin()
+                ext.batch_upload(
+                    self.h_x_fused, h2_rows[t].contiguous().float())
+                ext.batch_fill(self.h_y_acc, 0.0, cfg.hidden_size)
+                acc_t, sd_t, gsc_t = self._record_moe_in(i, h2_rows[t], ext)
+                ext.batch_submit()
+                acc_rows.append(acc_t)
+                sd_rows.append(sd_t)
+                gsc_rows.append(gsc_t)
+            x_rows = (
+                torch.stack(x1_rows) + torch.stack(acc_rows)
+                + torch.sigmoid(torch.stack(gsc_rows)) * torch.stack(sd_rows)
+            )
+        if final_norm:
+            norm_w = self._dense("language_model.model.norm.weight")
+            x_rows = torch.stack([
+                self._rms(x_rows[t], norm_w, cfg.rms_norm_eps)
+                for t in range(T)
+            ])
+        return x_rows
 
     def _record_gdn_in(
         self, i: int, ext: Any, download: bool = True,

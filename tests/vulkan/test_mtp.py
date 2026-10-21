@@ -138,6 +138,80 @@ def test_prefill_with_h_matches_prefill_chunked(gguf_model):
     assert torch.isfinite(h_rows).all()
 
 
+def test_mtp_walk_parity(gguf_model):
+    """The batched MTP walk == chained decode_step_batched (bit-exact),
+    and lands within the fork2 1e-5 bar of the sequential decode_step.
+
+    Every arm starts from the SAME pristine snapshot, restored at the top of
+    the arm - the GDN recurrence and the KV caches accumulate, so restoring
+    between rows inside an arm would desynchronize the chain (the harness
+    gotcha that produced the false "divergence at layer 1"). All arms see
+    the same embedding rows at the same positions ``pos..pos+T-1``.
+    """
+    from freetoken.models.qwen3_5_moe.vulkan.mtp import enable_mtp
+
+    model = gguf_model
+    head = enable_mtp(model)
+    if not head._batched:
+        pytest.skip(
+            "walk parity needs the batched MTP lane "
+            "(FTV_MTP_BATCHED=1 with the batched decode contract)"
+        )
+    t_rows = 4
+    model.reset()
+    logits = model.prefill_chunked(PROMPTS[0][1], chunk_size=64)
+    pos = model._seq_len
+    row_ids: list[int] = []
+    for _ in range(t_rows):
+        tid = int(logits.argmax().item())
+        row_ids.append(tid)
+        logits = model.decode_step(model.embed_row(tid), pos)
+        pos += 1
+        model._seq_len = pos
+    snap = _snapshot(model)
+    x_rows = torch.stack([model.embed_row(t) for t in row_ids])
+
+    _restore(model, snap)
+    w1_logits, w1_h = head.verify(pos, row_ids)
+    _restore(model, snap)
+    w2_logits, w2_h = head.verify(pos, row_ids)
+    _restore(model, snap)
+    bat_logits = torch.stack(
+        [model.decode_step_batched(x_rows[t], pos + t)
+         for t in range(t_rows)]
+    )
+    _restore(model, snap)
+    seq_logits = torch.stack(
+        [model.decode_step(x_rows[t], pos + t) for t in range(t_rows)]
+    )
+
+    d_walk = (w1_logits - w2_logits).abs().max().item()
+    d_walk_h = (w1_h - w2_h).abs().max().item()
+    assert torch.equal(w1_logits, w2_logits) and torch.equal(w1_h, w2_h), (
+        f"walk not bit-exact across restores: logits {d_walk:.3e} "
+        f"hidden {d_walk_h:.3e}"
+    )
+    d_bat = (w1_logits - bat_logits).abs().max().item()
+    # Expected 0.0: both arms run the same recorders row-for-row; only the
+    # lm cross differs (one T-row batch_bf16 call vs T single-row ones) and
+    # the shader is row-parallel in T.
+    assert torch.equal(w1_logits, bat_logits), (
+        f"walk vs chained decode_step_batched drifted {d_bat:.3e} "
+        "(if small, the lm cross is the suspect: move lm into the walk)"
+    )
+    d_seq = (w1_logits - seq_logits).abs().max().item()
+    print(
+        f"[walk parity] walk-walk {d_walk:.3e} (0), "
+        f"walk-batched {d_bat:.3e} (0), "
+        f"walk-sequential {d_seq:.3e} (<= 1e-5)",
+        flush=True,
+    )
+    assert d_seq <= 1e-5, (
+        f"walk vs sequential decode_step maxdiff {d_seq:.3e} > 1e-5 "
+        "(fork2 bar: lane rounding between the fused and host paths)"
+    )
+
+
 def test_mtp_identity(gguf_model):
     """MTP output tokens == the non-speculative greedy tokens."""
     model = gguf_model

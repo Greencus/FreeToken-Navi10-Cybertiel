@@ -5,17 +5,25 @@ speculative path against the non-speculative one on the same prompt, and to
 answer the question the identity gate cannot - whether drafting pays.
 
     FREETOKEN_TEST_MODEL_GGUF=<file> PYTHONPATH=python \
-        python tests/vulkan/bench_mtp.py --tokens 16 --n-max 3 --p-min 0,0.25
+        python tests/vulkan/bench_mtp.py --tokens 32 --rounds 3 \
+            --n-max 3 --p-min 0.25
 
-Reported per configuration:
+Measurement rules (benchmarks lie on a loaded box):
 
-- tok/s and s/tok over the timed generation (steady state: the expert LRU is
-  warmed by a discarded warm-up generation first, which is what makes cold
-  K-quant dequant and VRAM uploads stop dominating);
-- the MTP accept rate and per-phase ms (draft / verify / catch-up / rollback);
-- identity: the timed tokens must equal the baseline's - a bench that is fast
-  because it invented tokens is worse than no bench;
-- RSS and pinned resident bytes (VRAM) at the end of the run.
+- ``--rounds`` interleaves the arms (base, then each p_min, per round) so
+  both see the same thermal/cache drift; the verdict is the MEDIAN s/tok
+  per arm, and every round's MTP tokens must equal that round's baseline
+  tokens (identity every round, not once);
+- a discarded warm-up generation warms the expert LRU first, so cold
+  K-quant dequant and VRAM uploads stop dominating the timed windows;
+- decode-only s/tok is reported next to wall s/tok: prefill is timed
+  separately (baseline ``prefill_chunked``; MTP's own ms_prefill stats
+  include its prefill_with_h + draft catch-up) and subtracted per arm;
+- ``/proc/meminfo`` (Cached, swap-in-use), VRAM used and loadavg are
+  printed at start and end - a run with swap climbing or a loaded box is
+  flagged, not averaged over;
+- native counter deltas per token (submits, record barriers, queue-2
+  submits) separate structural cost from wall-clock noise.
 """
 from __future__ import annotations
 
@@ -23,6 +31,7 @@ import argparse
 import os
 import pathlib
 import resource
+import statistics
 import time
 
 import torch
@@ -37,20 +46,83 @@ def _rss_mb() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
 
-def _timed_generate(model, prompt, tokens, warmup):
-    if warmup:
-        model.generate(prompt, max_new=warmup, temperature=0.0)
-    t0 = time.perf_counter()
-    out = model.generate(prompt, max_new=tokens, temperature=0.0)
-    return out, time.perf_counter() - t0
+def _meminfo() -> dict[str, int]:
+    out: dict[str, int] = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, _, v = line.partition(":")
+            parts = v.split()
+            if parts and parts[0].isdigit():
+                out[k] = int(parts[0])  # kB
+    return out
 
 
-def _timed_mtp(model, prompt, tokens, warmup, n_max, p_min):
+def _vram_used_mb() -> int | None:
+    for p in sorted(pathlib.Path("/sys/class/drm").glob(
+            "card*/device/mem_info_vram_used")):
+        try:
+            return int(p.read_text().strip()) // 2**20
+        except OSError:
+            continue
+    return None
+
+
+def _env_line(tag: str) -> str:
+    m = _meminfo()
+    swap_used = max(0, m.get("SwapTotal", 0) - m.get("SwapFree", 0)) // 1024
+    load = os.getloadavg()[0]
+    vram = _vram_used_mb()
+    flag = " SWAP-RISING" if swap_used > 8 * 1024 else ""
+    flag += " LOADED" if load > 4.0 else ""
+    return (
+        f"env {tag}: avail={m.get('MemAvailable', 0) // 1024}MiB "
+        f"cached={m.get('Cached', 0) // 1024}MiB swap_used={swap_used}MiB "
+        f"vram={vram if vram is not None else '?'}MiB load={load:.2f}{flag}"
+    )
+
+
+def _counters(model) -> dict[str, int]:
+    ext = model.ext
+    return {
+        "submits": ext.batch_submit_count()[0],
+        "barriers": ext.batch_barrier_stats()[0],
+        "q2": ext.batch_upload_async_stats()[0],
+    }
+
+
+def _delta_str(c0: dict, c1: dict, tokens: int) -> str:
+    d = lambda k: (c1[k] - c0[k]) / tokens
+    return f"submits/tok {d('submits'):.1f} barriers/tok {d('barriers'):.1f} q2/tok {d('q2'):.1f}"
+
+
+def _timed_generate(model, tokens, warmup, batched=True):
     if warmup:
-        generate_mtp(model, prompt, max_new=warmup, n_max=n_max, p_min=p_min)
+        model.generate(PROMPT, max_new=warmup, temperature=0.0,
+                       prefill_chunk=64, batched=batched)
+    c0 = _counters(model)
     t0 = time.perf_counter()
-    out = generate_mtp(model, prompt, max_new=tokens, n_max=n_max, p_min=p_min)
-    return out, time.perf_counter() - t0
+    out = model.generate(PROMPT, max_new=tokens, temperature=0.0,
+                         prefill_chunk=64, batched=batched)
+    return out, time.perf_counter() - t0, _delta_str(c0, _counters(model), tokens)
+
+
+def _timed_mtp(model, tokens, warmup, n_max, p_min):
+    if warmup:
+        generate_mtp(model, PROMPT, max_new=warmup, n_max=n_max, p_min=p_min)
+    c0 = _counters(model)
+    t0 = time.perf_counter()
+    out = generate_mtp(model, PROMPT, max_new=tokens, n_max=n_max, p_min=p_min)
+    wall = time.perf_counter() - t0
+    st = dict(model.mtp.stats)
+    return out, wall, st, _delta_str(c0, _counters(model), tokens)
+
+
+def _timed_prefill(model) -> float:
+    """Baseline prefill wall time, for the decode-only split."""
+    model.reset()
+    t0 = time.perf_counter()
+    model.prefill_chunked(PROMPT, chunk_size=64)
+    return time.perf_counter() - t0
 
 
 def _batching_probe(model, head, prompt, tokens):
@@ -117,10 +189,11 @@ def _batching_probe(model, head, prompt, tokens):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=os.environ.get("FREETOKEN_TEST_MODEL_GGUF", ""))
-    ap.add_argument("--tokens", type=int, default=16)
+    ap.add_argument("--tokens", type=int, default=32)
+    ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--warmup", type=int, default=8)
     ap.add_argument("--n-max", type=int, default=3)
-    ap.add_argument("--p-min", default="0.0", help="comma-separated p_min values")
+    ap.add_argument("--p-min", default="0.25", help="comma-separated p_min values")
     ap.add_argument("--max-len", type=int, default=2048)
     args = ap.parse_args()
     if not args.model or not pathlib.Path(args.model).is_file():
@@ -130,53 +203,104 @@ def main() -> int:
     from freetoken.models.qwen3_5_moe.vulkan.mtp import enable_mtp
 
     torch.set_num_threads(8)
+    print(_env_line("start"), flush=True)
     t0 = time.perf_counter()
     model = ResidentGGUF(args.model, None, max_len=args.max_len)
     print(f"load {time.perf_counter() - t0:.1f}s rss={_rss_mb():.0f}MB", flush=True)
 
-    base_tokens, base_s = _timed_generate(model, PROMPT, args.tokens, args.warmup)
-    print(
-        f"baseline  {args.tokens} tok in {base_s:.1f}s = {base_s / args.tokens:.3f}s/tok "
-        f"({args.tokens / base_s:.2f} tok/s)",
-        flush=True,
-    )
+    p_mins = [float(x) for x in args.p_min.split(",")]
+
+    # Discarded warm-up for both arms, then a separate timed prefill so the
+    # decode-only split has the baseline's own number to subtract.
+    _timed_generate(model, args.warmup, 0)
+    base_prefill_s = _timed_prefill(model)
+    print(f"baseline prefill {base_prefill_s:.2f}s", flush=True)
 
     head = enable_mtp(model, n_max=args.n_max)
+    generate_mtp(model, PROMPT, max_new=args.warmup, n_max=args.n_max,
+                 p_min=p_mins[0])
     print(_batching_probe(model, head, PROMPT, min(8, args.tokens)), flush=True)
 
-    for p_min in [float(x) for x in args.p_min.split(",")]:
-        mtp_tokens, mtp_s = _timed_mtp(
-            model, PROMPT, args.tokens, args.warmup, args.n_max, p_min
-        )
-        st = dict(model.mtp.stats)
-        drafted, accepted = st["drafted"], st["accepted"]
-        rate = accepted / drafted if drafted else 0.0
-        ident = "IDENTICAL" if mtp_tokens == base_tokens else "DIVERGED"
-        rounds = st["rounds"]
-        passes = rounds + st["rollbacks"] + (drafted + rounds) / 40
+    base_wall: list[float] = []
+    base_dec: list[float] = []
+    base_tokens: list[list[int]] = []
+    mtp_wall: dict[float, list[float]] = {p: [] for p in p_mins}
+    mtp_dec: dict[float, list[float]] = {p: [] for p in p_mins}
+    mtp_ident: dict[float, int] = {p: 0 for p in p_mins}
+    mtp_last_st: dict[float, dict] = {p: {} for p in p_mins}
+
+    for rnd in range(1, args.rounds + 1):
+        bt, b_wall, b_cnt = _timed_generate(model, args.tokens, 0)
+        base_wall.append(b_wall)
+        base_dec.append(max(0.0, b_wall - base_prefill_s))
+        base_tokens.append(bt)
         print(
-            f"mtp n_max={args.n_max} p_min={p_min:g}  {args.tokens} tok in {mtp_s:.1f}s "
-            f"= {mtp_s / args.tokens:.3f}s/tok ({args.tokens / mtp_s:.2f} tok/s)  "
-            f"accept {accepted:.0f}/{drafted:.0f}={rate:.2f}  "
-            f"rounds {rounds:.0f} rollbacks {st['rollbacks']:.0f}  "
-            f"passes/token {passes / args.tokens:.3f}  {ident}",
+            f"round {rnd} base   {args.tokens}tok {b_wall:.2f}s "
+            f"{b_wall / args.tokens * 1e3:.1f}ms/tok "
+            f"decode-only {base_dec[-1] / args.tokens * 1e3:.1f}ms/tok  {b_cnt}",
             flush=True,
         )
-        print(
-            f"    prefill {st['ms_prefill']:.0f}ms draft {st['ms_draft']:.0f}ms "
-            f"verify {st['ms_verify']:.0f}ms catchup {st['ms_catchup']:.0f}ms "
-            f"rollback {st['ms_rollback']:.0f}ms",
-            flush=True,
-        )
-        if mtp_tokens != base_tokens:
-            for i, (a, b) in enumerate(zip(base_tokens, mtp_tokens)):
-                if a != b:
-                    print(f"    first mismatch at {i}: baseline {a} mtp {b}", flush=True)
-                    break
+        for p in p_mins:
+            mt, m_wall, st, m_cnt = _timed_mtp(
+                model, args.tokens, 0, args.n_max, p)
+            ident = mt == bt
+            mtp_ident[p] += int(ident)
+            mtp_wall[p].append(m_wall)
+            dec = max(0.0, m_wall - st.get("ms_prefill", 0.0) / 1e3)
+            mtp_dec[p].append(dec)
+            mtp_last_st[p] = st
+            drafted, accepted = st["drafted"], st["accepted"]
+            rate = accepted / drafted if drafted else 0.0
+            print(
+                f"round {rnd} mtp p_min={p:g} {args.tokens}tok {m_wall:.2f}s "
+                f"{m_wall / args.tokens * 1e3:.1f}ms/tok "
+                f"decode-only {dec / args.tokens * 1e3:.1f}ms/tok  "
+                f"accept {accepted}/{drafted}={rate:.2f}  {m_cnt}  "
+                f"{'IDENTICAL' if ident else 'DIVERGED'}",
+                flush=True,
+            )
+
+    med_base_w = statistics.median(base_wall)
+    med_base_d = statistics.median(base_dec)
     print(
-        f"rss_max={_rss_mb():.0f}MB resident={model.ext.resident_bytes_total() / 2**20:.0f}MiB",
+        f"\nmedian base:   wall {med_base_w / args.tokens * 1e3:.1f}ms/tok "
+        f"({args.tokens / med_base_w:.2f} tok/s)  decode-only "
+        f"{med_base_d / args.tokens * 1e3:.1f}ms/tok "
+        f"({args.tokens / med_base_d:.2f} tok/s)",
         flush=True,
     )
+    for p in p_mins:
+        med_w = statistics.median(mtp_wall[p])
+        med_d = statistics.median(mtp_dec[p])
+        st = mtp_last_st[p]
+        rounds = st.get("rounds", 0)
+        passes = rounds + st.get("rollbacks", 0) + (
+            st.get("drafted", 0) + rounds) / 40
+        speed_w = med_base_w / med_w
+        speed_d = med_base_d / med_d
+        print(
+            f"median mtp p_min={p:g}: wall {med_w / args.tokens * 1e3:.1f}ms/tok "
+            f"({args.tokens / med_w:.2f} tok/s)  decode-only "
+            f"{med_d / args.tokens * 1e3:.1f}ms/tok "
+            f"({args.tokens / med_d:.2f} tok/s)  "
+            f"x{speed_w:.2f} wall / x{speed_d:.2f} decode  "
+            f"identity {mtp_ident[p]}/{args.rounds}  "
+            f"passes/tok {passes / args.tokens:.3f}",
+            flush=True,
+        )
+        print(
+            f"    last round: prefill {st.get('ms_prefill', 0):.0f}ms "
+            f"draft {st.get('ms_draft', 0):.0f}ms verify {st.get('ms_verify', 0):.0f}ms "
+            f"catchup {st.get('ms_catchup', 0):.0f}ms "
+            f"rollback {st.get('ms_rollback', 0):.0f}ms",
+            flush=True,
+        )
+    print(
+        f"rss_max={_rss_mb():.0f}MB "
+        f"resident={model.ext.resident_bytes_total() / 2**20:.0f}MiB",
+        flush=True,
+    )
+    print(_env_line("end"), flush=True)
     return 0
 
 

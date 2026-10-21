@@ -54,9 +54,13 @@ One round at trunk position `pos` (the number of committed cells):
    sampler's top-10, is >= `p_min` (the gate fires *before* the token is
    accepted as a draft, as in llama.cpp).
 2. **verify** (`MtpHead.verify`) - one batched trunk pass over the `k+1`
-   candidate positions: the pending token plus the `k` drafts. This is the
-   production prefill layer walk (`_gdn_chunk` / `_full_attn_chunk` /
-   `_moe_chunk`), so its rows cost one dispatch per kernel, not one per token.
+   candidate positions: the pending token plus the `k` drafts. On the
+   batched decode base this is the multi-row walk `decode_rows_batched`
+   (section 7, "Batched walk"): one command buffer per layer phase for all
+   rows (GDN in-projections + recurrence, attention qkv / host SDPA / o_proj,
+   then one MoE submit per row), with the GPU GDN mirrors authoritative
+   afterwards. On the sequential base it falls back to the T>1 chunk lane
+   (`_gdn_chunk` / `_full_attn_chunk` / `_moe_chunk`).
 3. **accept** (`accept_greedy`) - `common_sampler_sample_and_accept_n`:
    greedy sample each verify row, stop at the first draft mismatch, always
    take one bonus sample when every draft matched. The round commits
@@ -186,6 +190,12 @@ otherwise):
   production `prefill_chunked` unchanged and only captures the post-final-norm
   hidden rows through a temporary hook on the decoder's `_rms`; the last-row
   logits must stay **bit-identical**.
+- `test_mtp_walk_parity` - the batched walk (`decode_rows_batched`) against
+  both restore-siblings and the shipped sequential decoder, from one
+  pristine snapshot with the harness gotcha (restore at the top of every
+  arm) respected: walk-vs-walk and walk-vs-chained-`decode_step_batched`
+  **bit-exact (0.0)**, walk-vs-`decode_step` within the fork2 bar
+  (9.775e-06 <= 1e-5). Skips when the batched MTP lane is off.
 - `test_mtp_identity` - 3 prompts x 6 greedy tokens by default
   (`FREETOKEN_TEST_MTP_TOKENS` raises it), MTP output identical to
   `model.generate`. This is the gate that catches a wrong `pending_h` shift, a
@@ -204,8 +214,10 @@ With the packed K-quant path as the weight path,
 tests/gguf_vulkan tests/kernel/vulkan -q` -> **120 passed, 5 skipped in
 414-465 s** (2026-10-21, defaults as shipped: `FTV_GGUF_BATCHED=1`,
 `FTV_EXP_CACHE_MB=2048`); the 5 skips are the safetensors/gpt-oss checkpoint
-gates whose checkpoints are not on this machine. `tests/vulkan/test_mtp.py`
-alone is 4 passed. The A/B numbers in section 7 were taken with
+gates whose checkpoints are not on this machine. After the batched walk
+landed (section 7), `tests/vulkan` alone re-ran **31 passed, 4 skipped in
+446 s** and `tests/vulkan/test_mtp.py` **5 passed** (the 5th is the walk
+parity gate). The A/B numbers in section 7 were taken with
 `tests/vulkan/bench_mtp.py`, which is the same code path.
 
 ## 7. Measured results (RX 5700 XT, RADV, CyberTiel GGUF, batch 1)
@@ -351,13 +363,83 @@ Accept rate 0.64 (9/14 drafted) in every round of every run, rollbacks 2 per
 the baseline. Phase ms per round on the batched base: verify 7695-7862,
 draft 355-412, catch-up 370-388, rollback 1226-1274.
 
-**Verdict: MTP is token-identical on the batched base but no longer pays on
-either base.** Its verify and catch-up walk the sequential T>1 K-quant lane
-(`_moe_chunk`, per-matrix keys), so a verify round costs about as much as
-`k+1` sequential tokens while committing only `k/(k+1)` of them; the 1.63x
-in the packed-path table above was measured against a 0.51 tok/s baseline
-that no longer exists. Until the T>1 lane gets batched K-quant recorders,
-run `--mtp` for correctness work, not for speed.
+**Verdict at that point: MTP is token-identical on the batched base but no
+longer pays on either base.** Its verify and catch-up walked the sequential
+T>1 K-quant lane (`_moe_chunk`, per-matrix keys), so a verify round cost
+about as much as `k+1` sequential tokens while committing only `k/(k+1)` of
+them; the 1.63x in the packed-path table above was measured against a 0.51
+tok/s baseline that no longer exists. **The fix for that has since landed**
+- the batched walk below.
+
+### Batched walk (2026-10-21, after `decode_rows_batched`)
+
+`MtpHead.verify` on the batched base now runs the multi-row walk
+`decode_rows_batched` (`nvfp4_resident.py`): per layer, one command buffer
+for all verify rows - GDN in-projections + conv + recurrence + out_proj +
+residual + readback (batch A, T rows), attention in-projections (batch 1)
+and out_proj (batch 2) for T rows, and the MoE phase with **one submit per
+row** (see the engine-bug note below). The GPU GDN mirrors are
+authoritative after a walk; `snapshot`/`restore` handle the pull-down.
+`FTV_MTP_BATCHED=0` falls back to the old chunk lane; the gate
+(`head._batched`) also refuses GPU-router and host-dequant sessions.
+
+Gates (all green, 2026-10-21): `test_mtp_walk_parity` walk-walk **0.0**,
+walk-vs-chained-`decode_step_batched` **0.0**, walk-vs-sequential
+**9.775e-06** (bar 1e-5); `test_mtp_identity` and the CLI identity
+(`[5844, 11, 13358, 11]` with and without `--mtp --mtp-p-min 0.25
+--mtp-n-max 3`) unchanged; `tests/vulkan` 31 passed / 4 skipped.
+
+`bench_mtp.py` (rewritten: interleaved arms, median of 3 rounds, 32 tokens,
+env + counter reporting, decode-only split) on a quiet box:
+
+| arm | wall ms/tok | tok/s | decode-only ms/tok | identity | accept | passes/tok |
+| --- | --- | --- | --- | --- | --- | --- |
+| baseline (`batched=True`) | 170.1 | 5.88 | 99.1 (10.09 tok/s) | - | - | 1.000 |
+| MTP `n_max=3 p_min=0.25` | 305.3 | 3.28 | 228.8 (4.37 tok/s) | **3/3** | 0.69 | 0.564 |
+
+MTP itself is **2.9x faster than on the old lane** (868.9 -> 305.3 ms/tok)
+and verify now costs ~1.07-1.15x a baseline token per row (the walk's
+batching works), but MTP still measures **0.56x the baseline**, for three
+measured reasons (cProfile, 16-token run):
+
+1. **Rows, not passes, are the unit.** At accept 0.69 a round commits
+   `accepted + 1` tokens from `drafted + 1` rows, so the run verified ~1.25
+   rows per token - `passes/token` 0.564 counts a T-row verify as one pass
+   and overstates the saving.
+2. **The walk costs ~280 submits per verify round vs the baseline's 91.**
+   GDN and attention phases are one submit for all T rows, but the MoE
+   phase submits per row (the workaround for the engine bug below) - 40
+   extra submits per round, plus every `batch_submit` fence wait measures
+   ~1.5 ms here.
+3. **`snapshot` is ~190 ms per round, untimed by the phase stats** - one
+   batched GDN/conv pull-down plus ~190 MB of host KV copies into the
+   rollback buffer. Dropping the KV half is sound in principle (cells past
+   the post-rollback position are never read before a later round
+   overwrites them, same argument as section 3) but changes rollback
+   semantics, so it is left as a follow-up, not done here.
+
+**Engine bug the MoE phase works around.** All T rows sharing `h_y_acc`
+inside ONE command buffer made the `batch_download(h_y_acc)` readbacks come
+back **all-NaN for rows 0..T-2 while the last row stayed clean**
+(reproducible, history-dependent; bits like `0xffd26000`, no infs - the
+readback sees garbage, not computed NaN). Static tracing of
+`batch_ensure_ordered`/`batch_fill`/`batch_kernel_record` says every
+observed hazard edge should barrier (48 barriers recorded in the failing
+batch), so the ordering gap is inside the engine's hazard bookkeeping, not
+in the walk's op sequence - kernel-lane territory (`ext_module.cpp` is
+read-only for this work). One-submit-per-row is exactly
+`decode_step_batched`'s proven shape and sidesteps it; when the engine
+fixes the multi-row pattern, the MoE phase collapses back to one submit
+and item 2's ~3x submit premium disappears.
+
+**Win condition, honestly stated.** With the engine fix (item 2), a verify
+round approaches 30x1 (GDN) + 10x2 (attention) + 40x1 (MoE) = **90
+submits per round regardless of T** - the same count the baseline pays per
+token - so a T-row verify edges toward T rows for the price of one, and the
+accept-rate math (rounds commit `accepted + 1` of `drafted + 1` rows) turns
+into a real 1.3-1.7x at the measured 0.64-0.69 accept. Until then `--mtp` is
+token-identical and 2.9x better than the old lane, but still slower than not
+drafting.
 
 
 ## 8. Known limits / follow-ups
@@ -381,8 +463,12 @@ run `--mtp` for correctness work, not for speed.
 - The verify is a *batched* trunk pass, not `k+1` sequential ones. On this
   backend that is the assumption the bench measures (see the batching probe in
   `bench_mtp.py`); if batching stops amortizing dispatch, MTP loses its edge
-  and the gate stays green while the bench shows it. **That has happened**: on
-  the current batched-decode base the verify lane is no longer the fast path,
-  and MTP measures 0.34x the baseline (section 7, "On the batched decode
-  base"). The fix is batched K-quant recorders for the T>1 `_moe_chunk` lane,
-  not a change to the draft/verify/accept logic.
+  and the gate stays green while the bench shows it. That happened once
+  (0.34x on the batched base while the verify still walked the sequential
+  T>1 lane) and the batched walk `decode_rows_batched` fixed it - MTP is now
+  2.9x faster than that lane and verify costs ~1.07-1.15x a baseline token
+  per row - but MTP still measures 0.56x the baseline because the MoE phase
+  must submit per row (engine multi-row hazard bug, section 7) and because
+  `passes/token` overstates the saving when a T-row verify counts as one
+  pass. The next lever is the engine fix, not a change to the
+  draft/verify/accept logic.

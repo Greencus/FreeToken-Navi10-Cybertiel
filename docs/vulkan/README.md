@@ -165,13 +165,19 @@ now 1.5-2.5x short of it rather than ~21x - the remaining cost is per-layer
 submit/fence overhead, not the weights (see
 [kquant-kernels.md](kquant-kernels.md)).
 
-**MTP speculative decode is correct on the batched base but does not pay.**
-`--mtp --mtp-p-min 0.25 --mtp-n-max 3` stays token-identical to the
-non-speculative greedy path with `FTV_GGUF_BATCHED=1`, but its verify and
-catch-up walk the sequential T>1 K-quant lane, so it measured **0.34x** the
-batched baseline (1.15 vs 3.4 tok/s, whole `generate()`) and 0.74x the
-sequential one. Use it for correctness work, not speed, until the T>1 lane
-gets its own batched recorders. See [mtp.md](mtp.md).
+**MTP speculative decode is token-identical but still slower than not
+drafting.** `--mtp --mtp-p-min 0.25 --mtp-n-max 3` stays token-identical to
+the non-speculative greedy path with `FTV_GGUF_BATCHED=1`. Its verify now
+runs the batched multi-row walk (`decode_rows_batched`, one command buffer
+per layer phase for all verify rows), which took it from 0.34x to **0.56x**
+of the batched baseline (3.28 vs 5.88 tok/s, median of 3 interleaved
+rounds, identity 3/3) - verify costs ~1.07x a baseline token per row, but a
+round verifies `drafted + 1` rows to commit `accepted + 1` tokens, the
+MoE phase must submit per row (an engine multi-row hazard bug, see
+[mtp.md](mtp.md)), and the rollback snapshot adds ~190 ms/round. Use it
+for correctness work, not speed, until the engine's multi-row MoE batch is
+fixed; the win condition and the measured numbers are in
+[mtp.md](mtp.md).
 
 ### Environment knobs
 

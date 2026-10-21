@@ -176,9 +176,11 @@ class GgufBatchedMixin:
         gu_sc: list[float] = []
         dn_w: list[int] = []
         dn_sc: list[float] = []
+        pending: list[tuple[int, torch.Tensor]] = []
         for e, expert in enumerate(elist):
-            h_gu, _gr, _gc = self._gguf_gu_handle(gate_mat, up_mat, expert)
-            h_dn, _dr, _dc = self._gguf_dn_handle(down_mat, expert)
+            h_gu, _gr, _gc = self._gguf_gu_handle(
+                gate_mat, up_mat, expert, pending)
+            h_dn, _dr, _dc = self._gguf_dn_handle(down_mat, expert, pending)
             gu_w.append(h_gu)
             dn_w.append(h_dn)
             gu_sc.append(1.0)  # K-quant packs its scales in-block
@@ -188,6 +190,18 @@ class GgufBatchedMixin:
         for expert in elist:
             self._cache_touch((id(gate_mat), id(up_mat), expert))
             self._cache_touch((id(down_mat), expert))
+        if pending:
+            # Drain this row's misses with one union copy: the fetch loop
+            # recorded no GPU work, so command order is unchanged and the
+            # union check emits the same barrier the first conflicting
+            # sequential copy did (none when the row touches nothing prior).
+            t0 = time.perf_counter()
+            ext.batch_upload_multi(
+                [h for h, _ in pending],
+                [w for _, w in pending],
+                [0] * len(pending),
+            )
+            self._bump("exp_up", time.perf_counter() - t0)
         gu_rows, gu_cols = gate_mat.rows, gate_mat.cols
         dn_rows, dn_cols = down_mat.rows, down_mat.cols
         q_g = self._packed_qtype(gate_mat)
@@ -242,7 +256,11 @@ class GgufBatchedMixin:
 
     # -- packed-expert handle fetch (resident LRU, in-batch upload) ------
     def _gguf_gu_handle(
-        self, gate_mat: ExpertBank, up_mat: ExpertBank, expert: int
+        self,
+        gate_mat: ExpertBank,
+        up_mat: ExpertBank,
+        expert: int,
+        pending: list[tuple[int, torch.Tensor]] | None = None,
     ) -> tuple[int, int, int]:
         """Packed stacked gate+up bundle handle (2N rows, gate first).
 
@@ -292,11 +310,14 @@ class GgufBatchedMixin:
             # 4 B past the last packed row (same slack _expert_handle).
             weight = torch.cat([weight, weight.new_zeros(4)])
         self._bump("exp_packed", time.perf_counter() - t0)
-        h_w = self._gguf_cache_resident(key, weight)
+        h_w = self._gguf_cache_resident(key, weight, pending)
         return h_w, gate_mat.rows * 2, gate_mat.cols
 
     def _gguf_dn_handle(
-        self, down_mat: ExpertBank, expert: int
+        self,
+        down_mat: ExpertBank,
+        expert: int,
+        pending: list[tuple[int, torch.Tensor]] | None = None,
     ) -> tuple[int, int, int]:
         """Packed down-matrix handle via the resident LRU.
 
@@ -333,18 +354,25 @@ class GgufBatchedMixin:
         if qtype == "q8_0":
             weight = torch.cat([weight, weight.new_zeros(4)])
         self._bump("exp_packed", time.perf_counter() - t0)
-        h_w = self._gguf_cache_resident(key, weight)
+        h_w = self._gguf_cache_resident(key, weight, pending)
         return h_w, down_mat.rows, down_mat.cols
 
-    def _gguf_cache_resident(self, key: tuple, weight: torch.Tensor) -> int:
+    def _gguf_cache_resident(
+        self,
+        key: tuple,
+        weight: torch.Tensor,
+        pending: list[tuple[int, torch.Tensor]] | None = None,
+    ) -> int:
         """Insert ``weight`` into the resident LRU, uploading INSIDE the
         open batch (pooled-handle reuse or a fresh allocation + recorded
         copy), so a decode cache miss costs no sync submit/fence - the
         hazard barrier the batch engine emits before the first consumer
         dispatch orders the copy.
 
-        The torch tensor is memcpy'd into batch-owned staging at record
-        time (``batch_upload``), so the caller may drop it right after.
+        With ``pending`` the destination is allocated and cached but the
+        copy is deferred: the caller drains the collected misses with one
+        ``batch_upload_multi`` right after its fetch loop, so ``weight``
+        must stay alive in ``pending`` until then.
         """
         ext = self.ext
         w_bytes = weight.numel() * weight.element_size()
@@ -354,7 +382,10 @@ class GgufBatchedMixin:
             h_w = pooled[0]
         else:
             h_w = ext.allocate_resident(w_bytes)
-        ext.batch_upload(h_w, weight)
+        if pending is None:
+            ext.batch_upload(h_w, weight)
+        else:
+            pending.append((h_w, weight))
         self._bump("exp_up", time.perf_counter() - t0)
         self._cache_put(key, (h_w, 0, w_bytes, w_bytes, 0))
         self._cache_freq(key)

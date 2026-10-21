@@ -51,6 +51,7 @@ the entry point; ``enable_mtp`` prepares a resident model for it.
 """
 from __future__ import annotations
 
+import os
 import time
 from contextlib import contextmanager
 from typing import Any
@@ -153,6 +154,18 @@ class MtpHead:
         self.p_min = float(p_min)
         self.top_k = int(top_k)
         self.eps = cfg.rms_norm_eps
+
+        # Run verify / draft / catch-up on the batched multi-row walk
+        # (decode_rows_batched) when the batched decode contract holds -
+        # the T>1 K-quant chunk lane stays as the reference/fallback and
+        # is forced with FTV_MTP_BATCHED=0.
+        self._batched = (
+            getattr(model, "_gguf_batched", False)
+            and getattr(model, "_packed_kq", False)
+            and getattr(model, "_exp_cache_budget", 0) > 0
+            and not getattr(model, "_gpu_router", True)
+            and os.environ.get("FTV_MTP_BATCHED", "1").strip() != "0"
+        )
 
         # Admit blk.40's dense names to the provider, then pin them with the
         # GGUF decoder's own helpers. _fetch already knows every leaf below,
@@ -272,7 +285,8 @@ class MtpHead:
     def _block_step(
         self, pos: int, x0: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One block pass at ``pos`` through the sequential kernels (T=1).
+        """One block pass at ``pos`` (T=1): the batched walk when
+        ``_batched``, else the sequential kernels.
 
         Returns ``(logits [vocab], h_nextn [H])``; ``h_nextn`` is the
         ``shared_head_norm`` output, the draft chain's next h input.
@@ -281,6 +295,14 @@ class MtpHead:
         cfg = model.config
         base = f"language_model.model.layers.{MTP_LAYER}"
         with self._mtp_kv():
+            if self._batched:
+                x = model.decode_rows_batched(
+                    x0.unsqueeze(0), pos,
+                    layers=[(MTP_LAYER, "full_attention")],
+                    final_norm=False,
+                )
+                hn = _rms_raw(x[0], self.shared_head_norm, cfg.rms_norm_eps)
+                return model._pinned_affine(hn, "language_model.lm_head"), hn
             h = model._rms(
                 x0, model._dense(f"{base}.input_layernorm.weight"), cfg.rms_norm_eps
             )
@@ -297,12 +319,24 @@ class MtpHead:
     def _block_chunk(
         self, pos: int, x0: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The same block pass batched over ``x0``'s rows (T>1 kernels)."""
+        """The same block pass over ``x0``'s rows (batched walk when
+        ``_batched``, else the T>1 chunk kernels)."""
         model = self.model
         cfg = model.config
         base = f"language_model.model.layers.{MTP_LAYER}"
         tc = x0.shape[0]
         with self._mtp_kv():
+            if self._batched:
+                x = model.decode_rows_batched(
+                    x0, pos,
+                    layers=[(MTP_LAYER, "full_attention")],
+                    final_norm=False,
+                )
+                hn = _rms_raw(x, self.shared_head_norm, cfg.rms_norm_eps)
+                logits = model._pinned_affine_batch(
+                    hn, "language_model.lm_head")
+                assert logits.shape == (tc, model.config.vocab_size)
+                return logits, hn
             h = model._rms(
                 x0, model._dense(f"{base}.input_layernorm.weight"), cfg.rms_norm_eps
             )
@@ -322,14 +356,19 @@ class MtpHead:
     def verify(self, pos: int, token_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
         """One batched trunk pass over ``token_ids`` at ``pos``.
 
-        The production prefill layer walk, so the rows cost one dispatch per
-        kernel regardless of how many candidates the round verified. Returns
-        ``(logits [T, vocab], h_nextn [T, H])`` - the post-final-norm hidden
-        rows, which is what the MTP catch-up feeds back.
+        Returns ``(logits [T, vocab], h_nextn [T, H])`` - the post-final-norm
+        hidden rows, which is what the MTP catch-up feeds back.
         """
         model = self.model
         cfg = model.config
         x = torch.stack([model.embed_row(t) for t in token_ids])
+        if self._batched:
+            # The batched walk: one command buffer per layer phase for all
+            # T rows; it leaves _gdn_gpu_dirty False (the GPU GDN mirrors
+            # just became authoritative), unlike the chunk lane below.
+            x = model.decode_rows_batched(x, pos)
+            logits = model._pinned_affine_batch(x, "language_model.lm_head")
+            return logits, x
         for i, layer_type in enumerate(cfg.layer_types):
             base = f"language_model.model.layers.{i}"
             h = model._rms(
@@ -353,12 +392,31 @@ class MtpHead:
         return logits, x
 
     def snapshot(self) -> None:
-        """Copy the trunk's recurrent + KV state (rollback point)."""
+        """Copy the trunk's recurrent + KV state (rollback point).
+
+        With host state authoritative (chunk/sequential lane ran last)
+        the host rows are copied as-is; with the GPU mirrors authoritative
+        (batched walk ran last) they are pulled down first - the host rows
+        may be stale then, and ``restore`` always writes host -> dirty.
+        The KV caches are host tensors in both lanes (attention runs on
+        host), so they are copied directly either way.
+        """
         model = self.model
-        for i, t in model.gdn_state.items():
-            self._snap["gdn"][i].copy_(t)
-        for i, t in model.conv_buf.items():
-            self._snap["conv"][i].copy_(t)
+        if model._gdn_gpu_dirty:
+            for i, t in model.gdn_state.items():
+                self._snap["gdn"][i].copy_(t)
+            for i, t in model.conv_buf.items():
+                self._snap["conv"][i].copy_(t)
+        else:
+            ext = model.ext
+            ext.batch_begin()
+            for i in model.gdn_state_gpu:
+                ext.batch_download(
+                    model.gdn_state_gpu[i], self._snap["gdn"][i])
+            for i in model.conv_buf_gpu:
+                ext.batch_download(
+                    model.conv_buf_gpu[i], self._snap["conv"][i])
+            ext.batch_submit()
         for i, t in model.k_cache.items():
             self._snap["k"][i].copy_(t)
         for i, t in model.v_cache.items():
