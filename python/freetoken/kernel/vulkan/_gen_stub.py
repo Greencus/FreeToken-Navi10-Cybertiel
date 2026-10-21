@@ -30,6 +30,7 @@ _TYPE_MAP = [
 # Known no-arg stats helpers: specialize the generic tuple return.
 _RET_OVERRIDES = {
     "desc_cache_stats": "tuple[int, int, int, int, int, int]",
+    "batch_deferred_stats": "tuple[int, int, int, int]",
     "batch_barrier_stats": "tuple[int, int]",
     "batch_submit_count": "tuple[int, int]",
     "batch_upload_async_stats": "tuple[int, int]",

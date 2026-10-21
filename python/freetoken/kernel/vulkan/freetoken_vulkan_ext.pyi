@@ -43,6 +43,12 @@ def batch_cross_barrier() -> None:
     ...
 
 
+def batch_deferred_stats() -> tuple[int, int, int, int]:
+    """Cumulative deferred buffer frees, frees still pending, transient pool rotations (mid-batch full), cache-pool reset pending flag.
+    """
+    ...
+
+
 def batch_download(handle: int, tensor: torch.Tensor, offset: int = 0) -> None:
     """Record a device->host readback; the tensor is filled after submit.
     """

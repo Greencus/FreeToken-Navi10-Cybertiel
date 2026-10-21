@@ -319,6 +319,18 @@ static uint32_t g_desc_pool_used;
 static VkDescriptorPool g_desc_cache_pool;
 static uint32_t g_desc_cache_pool_used;
 
+// Forward: batch state lives with the batching section below.  Destruction
+// and descriptor-pool resets deferred while a command buffer is open must
+// wait for that batch's fence (batch_deferred_drain), so the resident and
+// descriptor helpers above need to know whether a batch is open.
+static bool batch_open();
+// Buffers freed mid-batch: the handle is erased from g_resident
+// immediately, but the VkBuffer lives until the open batch's fence
+// completes (freeing it now would destroy or recycle a buffer the
+// recorded command buffer already binds).
+static std::vector<vku::Buffer> g_deferred_frees;
+static uint64_t g_deferred_free_total = 0;
+
 // Descriptor-set cache (task #12 opt): decode re-binds the SAME
 // (pipeline, buffers) combos every token (cache-hit experts, pinned
 // dense weights, fixed scratch). Keyed lookup skips vkAllocate +
@@ -351,14 +363,30 @@ static std::unordered_map<DescKey, VkDescriptorSet, DescKeyHash> g_desc_cache;
 static uint64_t g_desc_hits = 0;
 static uint64_t g_desc_miss = 0;
 static uint64_t g_desc_clears = 0;
+// Mid-batch safety state (see batch_deferred_drain): resetting a descriptor
+// pool whose sets are already bound in the open command buffer would recycle
+// those set handles into new bindings - the recorded commands would then
+// read/write the wrong buffers.  Both the cache-pool reset and the transient
+// pool's reset-when-full are therefore deferred/rotated while a batch is
+// open and drained after its fence.
+static bool g_desc_cache_reset_pending = false;
+static std::vector<VkDescriptorPool> g_desc_pools_retired;
+static uint64_t g_desc_pool_rotated_total = 0;
 
 static void desc_cache_clear() {
     auto& ctx = get_ctx();
+    g_desc_cache.clear();
+    g_desc_clears++;
+    if (batch_open()) {
+        // The open command buffer may bind sets from g_desc_cache_pool;
+        // defer the reset to batch drain.  Entries are dropped now so no
+        // new lookup returns a set that is about to be reset.
+        g_desc_cache_reset_pending = true;
+        return;
+    }
     if (g_desc_cache_pool != VK_NULL_HANDLE)
         vkResetDescriptorPool(ctx.device, g_desc_cache_pool, 0);
     g_desc_cache_pool_used = 0;
-    g_desc_cache.clear();
-    g_desc_clears++;
 }
 
 void free_resident_vulkan(int64_t handle) {
@@ -366,6 +394,16 @@ void free_resident_vulkan(int64_t handle) {
     if (it == g_resident.end()) return;
     vku::Buffer buf = it->second;
     g_resident.erase(it);
+    // Mid-batch destruction is deferred: the open command buffer may already
+    // bind this VkBuffer, and recycling it into a same-batch upload would
+    // make those recorded dispatches read the new occupant's bytes (the
+    // all-NaN acc readbacks).  The handle is dead to the caller immediately;
+    // the VkBuffer itself lives until batch drain.
+    if (batch_open()) {
+        g_deferred_frees.push_back(buf);
+        g_deferred_free_total++;
+        return;
+    }
     // Device buffers recycle through the pool when there is room (cached
     // descriptor sets stay valid - the VkBuffer is still alive and the
     // next upload is fence-ordered before any dispatch can read it). Only
@@ -534,8 +572,20 @@ static VkDescriptorSet make_descriptor_set(
     const std::vector<VkBuffer>& buffers) {    auto& ctx = get_ctx();
     ensure_desc_pool();
     if (g_desc_pool_used + 1 > kDescPoolMaxSets) {
-        vkResetDescriptorPool(ctx.device, g_desc_pool, 0);
-        g_desc_pool_used = 0;
+        if (batch_open()) {
+            // Mid-batch: the open command buffer binds sets from this pool;
+            // resetting would recycle those set handles into new bindings.
+            // Retire the whole pool (destroyed at batch drain) and start a
+            // fresh one instead.
+            g_desc_pools_retired.push_back(g_desc_pool);
+            g_desc_pool = VK_NULL_HANDLE;
+            g_desc_pool_used = 0;
+            g_desc_pool_rotated_total++;
+            ensure_desc_pool();
+        } else {
+            vkResetDescriptorPool(ctx.device, g_desc_pool, 0);
+            g_desc_pool_used = 0;
+        }
     }
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dai.descriptorPool = g_desc_pool;
@@ -1377,6 +1427,34 @@ static struct BatchState {
     };
     std::unordered_map<VkBuffer, Access> acc;
 } g_batch;
+
+static bool batch_open() { return g_batch.active; }
+
+// Drain the mid-batch deferrals after a completed submission: the fence has
+// been waited, so deferred buffer destruction, the deferred cache-pool reset
+// and retired transient pools are all safe to release now.  Called from
+// batch_submit AFTER g_batch.active = false so the helpers below take their
+// immediate paths.
+static void batch_deferred_drain() {
+    auto& ctx = get_ctx();
+    bool destroyed = false;
+    for (auto& b : g_deferred_frees)
+        destroyed |= get_pool().release_device(b);
+    g_deferred_frees.clear();
+    if (g_desc_cache_reset_pending) {
+        if (g_desc_cache_pool != VK_NULL_HANDLE)
+            vkResetDescriptorPool(ctx.device, g_desc_cache_pool, 0);
+        g_desc_cache_pool_used = 0;
+        g_desc_cache_reset_pending = false;
+    } else if (destroyed && !g_desc_cache.empty()) {
+        // A deferred free destroyed its buffer (pool full / oversized):
+        // purge the cache now that the batch is closed.
+        desc_cache_clear();
+    }
+    for (VkDescriptorPool p : g_desc_pools_retired)
+        vkDestroyDescriptorPool(ctx.device, p, nullptr);
+    g_desc_pools_retired.clear();
+}
 
 // ============================================================
 // Async upload queue (task #29): vkCmdCopyBuffer H2D uploads run on a
@@ -2303,6 +2381,9 @@ static double batch_submit_vulkan(
         sem_release(sem);
     }
     g_batch.active = false;
+    // Fence completed: release whatever mid-batch destruction/reset was
+    // deferred (see batch_deferred_drain).
+    batch_deferred_drain();
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
@@ -3059,6 +3140,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                               (uint64_t)g_desc_clears);
     }, "Descriptor cache entries, transient pool used, cache pool used, "
        "cache hits, cache misses, cache clears.");
+    m.def("batch_deferred_stats", []() -> py::tuple {
+        return py::make_tuple((uint64_t)g_deferred_free_total,
+                              (uint64_t)g_deferred_frees.size(),
+                              (uint64_t)g_desc_pool_rotated_total,
+                              (uint64_t)(g_desc_cache_reset_pending ? 1 : 0));
+    }, "Cumulative deferred buffer frees, frees still pending, transient "
+       "pool rotations (mid-batch full), cache-pool reset pending flag.");
     m.def("qwen3_decode_layer_awq_twostage_resident",
           &qwen3_decode_layer_awq_twostage_resident_vulkan,
           "Fused two-stage fully resident AWQ Qwen layer.");
