@@ -58,6 +58,21 @@ For More details:
 - [Repairing old FTW checkpoints](https://github.com/FlashML-org/FreeToken/blob/main/docs/ftw-hotfix.md)
 - [Diagnosing a checkpoint that fails to load](https://github.com/FlashML-org/FreeToken/blob/main/scripts/checkpoint_diagnose/README.md)
 
+### AMD GPUs (Vulkan backend)
+
+This fork carries a from-scratch Vulkan compute backend for AMD RDNA1/RDNA2
+cards, ported from the standalone `freetoken-vulkan` project. It runs the
+Qwen3.5-MoE family without CUDA, ROCm or Triton, and it does not change the
+NVIDIA path.
+
+```bash
+export FREETOKEN_VULKAN_SHADERS=/path/to/shaders
+python -m freetoken.models.qwen3_5_moe.vulkan.cli --model /path/to/checkpoint --prompt "hello"
+```
+
+See [docs/vulkan/README.md](docs/vulkan/README.md) for the build, the runtime
+knobs, the hardware notes for gfx1010 and the correctness gates.
+
 ## Citation
 
 If you use FreeToken for your research, please cite our [paper](https://arxiv.org/abs/2608.16157):
