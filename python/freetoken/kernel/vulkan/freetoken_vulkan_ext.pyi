@@ -163,6 +163,12 @@ def batch_upload_async_stats() -> tuple[int, int]:
     ...
 
 
+def batch_upload_multi(handles: list[int], tensors: list[torch.Tensor], offsets: list[int]) -> None:
+    """Record N host->device copies into the open batch in one crossing (one hazard check, one barrier group; falls back to a single sync submit when no batch is open). Ranges must be distinct.
+    """
+    ...
+
+
 def batch_vecadd_io(h_a: int, h_b: int, h_out: int, N: int) -> None:
     """Record elementwise c = a + b into the open batch.
     """
@@ -495,5 +501,11 @@ def upload_resident(tensor: torch.Tensor) -> int:
 
 def upload_resident_batch(handles: list[int], tensors: list[torch.Tensor], offsets: list[int]) -> None:
     """Upload CPU tensors into resident-buffer subranges in one submit.
+    """
+    ...
+
+
+def upload_resident_multi(tensors: list[torch.Tensor]) -> list[int]:
+    """Upload CPU tensors into N fresh pooled resident buffers with one staging pass and one submit. Returns the N int64 handles; tensor sizes may differ.
     """
     ...

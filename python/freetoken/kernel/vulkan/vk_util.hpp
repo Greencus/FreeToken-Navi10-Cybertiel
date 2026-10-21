@@ -19,6 +19,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <vector>
+#include <unordered_map>
 
 namespace vku {
 
@@ -394,8 +395,20 @@ struct BufferPool {
     Context* ctx = nullptr;
     static constexpr uint32_t kNumBuckets = 18; // 4 KiB .. 512 MiB
     static constexpr size_t   kMaxPerBucket = 64;
+    // Device-local free lists for the sync one-shot upload path, keyed by
+    // EXACT byte size - NOT power-of-two buckets. The engine's VRAM budget
+    // (FTV_EXP_CACHE_MB) is counted in requested bytes, so bucket rounding
+    // silently inflates driver VRAM by ~13% (measured: +1.1 GB over the
+    // 2048 MiB budget, at the GTT-spill edge of this 8 GB card). Alloc
+    // sizes repeat per layer shape, so exact-size reuse still hits on the
+    // hot paths. Two bounds so evictions still return VRAM: at most 16
+    // free buffers per size and 128 MiB TOTAL across all sizes.
+    static constexpr uint32_t kMaxPerSizeDev = 16;
+    static constexpr size_t   kMaxTotalDevBytes = 128ull << 20;
 
     std::vector<Buffer> host_pool[kNumBuckets];
+    std::unordered_map<size_t, std::vector<Buffer>> dev_pool;
+    size_t dev_held_bytes = 0;
 
     static uint32_t bucket_of(size_t bytes) {
         // Smallest bucket = 4 KiB. Bucket i holds sizes (2^(11+i), 2^(12+i)].
@@ -451,15 +464,61 @@ struct BufferPool {
         }
     }
 
+    // Device-local destination for the sync one-shot upload path. Reusing
+    // a pooled buffer skips vkCreateBuffer + vkAllocateMemory +
+    // vkBindBufferMemory per upload, the churn that kept the sync path at
+    // ~4-5 GB/s while the pooled batched path ran at ~12. Exact-size key,
+    // so a hit returns a buffer of EXACTLY the requested bytes (VRAM
+    // accounting identical to a fresh allocation).
+    Buffer acquire_device(size_t bytes) {
+        auto it = dev_pool.find(bytes);
+        if (it != dev_pool.end() && !it->second.empty()) {
+            Buffer b = it->second.back();
+            it->second.pop_back();
+            dev_held_bytes -= (size_t)b.size;
+            if (it->second.empty()) dev_pool.erase(it);
+            return b;
+        }
+        return make_device_ssbo(*ctx, bytes);
+    }
+
+    // Returns true when the buffer was DESTROYED (per-size free list full,
+    // or the 128 MiB global budget would be exceeded) - the caller must
+    // then purge anything that may still reference the dead VkBuffer
+    // (descriptor-set cache). A pooled buffer stays alive, so its cached
+    // descriptor sets remain valid.
+    bool release_device(Buffer& b) {
+        if (!b.buf) return false;
+        const size_t sz = (size_t)b.size;
+        auto it = dev_pool.find(sz);
+        const bool full = it != dev_pool.end()
+                          && it->second.size() >= kMaxPerSizeDev;
+        if (!full && dev_held_bytes + sz <= kMaxTotalDevBytes) {
+            dev_pool[sz].push_back(b);
+            dev_held_bytes += sz;
+            b = {};
+            return false;
+        }
+        destroy_buffer(*ctx, b);
+        return true;
+    }
+
     void destroy_all() {
         for (auto& bucket : host_pool) {
             for (auto& b : bucket) destroy_buffer(*ctx, b);
             bucket.clear();
         }
+        for (auto& [sz, bufs] : dev_pool) {
+            (void)sz;
+            for (auto& b : bufs) destroy_buffer(*ctx, b);
+            bufs.clear();
+        }
+        dev_pool.clear();
+        dev_held_bytes = 0;
     }
 
     size_t total_bytes_held() const {
-        size_t total = 0;
+        size_t total = dev_held_bytes;
         for (const auto& bucket : host_pool) {
             for (const auto& b : bucket) total += (size_t)b.size;
         }
@@ -490,69 +549,6 @@ inline void download(const Context& ctx, Buffer& b, void* dst, VkDeviceSize byte
     invalidate_host_read(ctx, b, 0, bytes);
     std::memcpy(dst, p, (size_t)bytes);
     vkUnmapMemory(ctx.device, b.mem);
-}
-
-// Upload from CPU into a device-local Buffer via a temporary staging buffer.
-// Slow (one queue submit per call) but only needed at load time for weights
-// that then live across many kernel invocations.
-inline void upload_via_staging(const Context& ctx, Buffer& device_buf,
-                                const void* src, VkDeviceSize bytes) {
-    // 1. Allocate temp staging buffer, memcpy CPU -> staging.
-    // Mode 2 keeps this one-shot sync path on a temporary map while the
-    // pooled/async paths stay persistently mapped.
-    Buffer staging = make_host_ssbo(ctx, bytes, staging_map_mode() == 1);
-    upload(ctx, staging, src, bytes);
-
-    // 2. Record a one-shot command buffer that copies staging -> device.
-    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = ctx.command_pool;
-    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    ai.commandBufferCount = 1;
-    VkCommandBuffer cmd;
-    VKU_CHECK(vkAllocateCommandBuffers(ctx.device, &ai, &cmd));
-
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VKU_CHECK(vkBeginCommandBuffer(cmd, &bi));
-
-    VkBufferCopy copy{};
-    copy.size = bytes;
-    vkCmdCopyBuffer(cmd, staging.buf, device_buf.buf, 1, &copy);
-
-    VKU_CHECK(vkEndCommandBuffer(cmd));
-
-    // 3. Submit and wait.
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    VKU_CHECK(vkQueueSubmit(ctx.queue, 1, &si, VK_NULL_HANDLE));
-    VKU_CHECK(vkQueueWaitIdle(ctx.queue));
-
-    // 4. Cleanup.
-    vkFreeCommandBuffers(ctx.device, ctx.command_pool, 1, &cmd);
-    destroy_buffer(ctx, staging);
-}
-
-// ============================================================
-// Shader helpers.
-// ============================================================
-inline std::vector<uint32_t> load_spirv(const char* path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) { std::fprintf(stderr, "cannot open %s\n", path); std::exit(1); }
-    size_t bytes = (size_t)f.tellg();
-    std::vector<uint32_t> code(bytes / 4);
-    f.seekg(0);
-    f.read(reinterpret_cast<char*>(code.data()), bytes);
-    return code;
-}
-
-inline VkShaderModule make_shader_module(VkDevice dev, const std::vector<uint32_t>& spv) {
-    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smi.codeSize = spv.size() * 4;
-    smi.pCode = spv.data();
-    VkShaderModule sm;
-    VKU_CHECK(vkCreateShaderModule(dev, &smi, nullptr, &sm));
-    return sm;
 }
 
 // ============================================================
@@ -620,6 +616,57 @@ inline double submit_and_wait(const Context& ctx, Fn record) {
     auto t1 = std::chrono::steady_clock::now();
 
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+// Upload from CPU into a device-local Buffer via staging. When `pool` is
+// given the staging buffer comes from (and returns to) its HOST_VISIBLE
+// free list, and the copy reuses submit_and_wait's shared command buffer
+// + fence - no per-call staging/cmd alloc, no vkQueueWaitIdle. Without a
+// pool this is the legacy temporary-everything behaviour.
+inline void upload_via_staging(const Context& ctx, Buffer& device_buf,
+                                const void* src, VkDeviceSize bytes,
+                                BufferPool* pool = nullptr) {
+    // 1. Staging buffer + memcpy CPU -> staging. Mode 2 keeps this one-shot
+    // sync path on a temporary map while the pooled/async paths stay
+    // persistently mapped.
+    Buffer staging;
+    if (pool) staging = pool->acquire_host((size_t)bytes);
+    else      staging = make_host_ssbo(ctx, bytes, staging_map_mode() == 1);
+    upload(ctx, staging, src, bytes);
+
+    // 2. Record staging -> device on the shared one-shot command buffer,
+    // submit, and wait the fence (submit_and_wait reuses both).
+    submit_and_wait(ctx, [&](VkCommandBuffer cmd) {
+        VkBufferCopy copy{};
+        copy.size = bytes;
+        vkCmdCopyBuffer(cmd, staging.buf, device_buf.buf, 1, &copy);
+    });
+
+    // 3. Recycle or free the staging buffer.
+    if (pool) pool->release_host(staging);
+    else      destroy_buffer(ctx, staging);
+}
+
+// ============================================================
+// Shader helpers.
+// ============================================================
+inline std::vector<uint32_t> load_spirv(const char* path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) { std::fprintf(stderr, "cannot open %s\n", path); std::exit(1); }
+    size_t bytes = (size_t)f.tellg();
+    std::vector<uint32_t> code(bytes / 4);
+    f.seekg(0);
+    f.read(reinterpret_cast<char*>(code.data()), bytes);
+    return code;
+}
+
+inline VkShaderModule make_shader_module(VkDevice dev, const std::vector<uint32_t>& spv) {
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = spv.size() * 4;
+    smi.pCode = spv.data();
+    VkShaderModule sm;
+    VKU_CHECK(vkCreateShaderModule(dev, &smi, nullptr, &sm));
+    return sm;
 }
 
 // ============================================================

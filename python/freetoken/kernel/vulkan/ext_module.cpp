@@ -95,8 +95,12 @@ int64_t upload_resident_vulkan(torch::Tensor t) {
     auto tc = t.contiguous();
     const size_t bytes = (size_t)tc.numel() * tc.element_size();
     auto& ctx = get_ctx();
-    vku::Buffer buf = vku::make_device_ssbo(ctx, bytes);
-    vku::upload_via_staging(ctx, buf, tc.data_ptr(), bytes);
+    // Pooled device destination + pooled staging + the shared one-shot
+    // command buffer: the sync path pays none of the per-call
+    // vkAllocateMemory/vkBindBufferMemory/cmd-alloc/vkQueueWaitIdle churn
+    // (that churn is what kept it at ~4-5 GB/s vs ~12 batched).
+    vku::Buffer buf = get_pool().acquire_device(bytes);
+    vku::upload_via_staging(ctx, buf, tc.data_ptr(), bytes, &get_pool());
     const int64_t h = g_next_handle++;
     g_resident.emplace(h, buf);
     return h;
@@ -104,8 +108,7 @@ int64_t upload_resident_vulkan(torch::Tensor t) {
 
 int64_t allocate_resident_vulkan(int64_t bytes) {
     TORCH_CHECK(bytes > 0, "resident allocation size must be positive");
-    auto& ctx = get_ctx();
-    vku::Buffer buf = vku::make_device_ssbo(ctx, (VkDeviceSize)bytes);
+    vku::Buffer buf = get_pool().acquire_device((VkDeviceSize)bytes);
     const int64_t h = g_next_handle++;
     g_resident.emplace(h, buf);
     return h;
@@ -256,14 +259,12 @@ void upload_resident_batch_vulkan(
         mapped.push_back(vku::host_write_begin(ctx, staging.back(), n));
     }
 
-    std::vector<std::future<void>> copies;
-    copies.reserve(tensors.size());
     for (size_t i = 0; i < tensors.size(); ++i) {
-        copies.push_back(std::async(std::launch::async, [&, i] {
-            std::memcpy(mapped[i], contiguous[i].data_ptr(), bytes[i]);
-        }));
+        // Serial memcpy: at slab sizes (<= a few MB) spawning a thread per
+        // copy costs more than the parallelism returns (measured 0.6x at
+        // N=8); the BAR memcpy is a serial bottleneck anyway.
+        std::memcpy(mapped[i], contiguous[i].data_ptr(), bytes[i]);
     }
-    for (auto& copy : copies) copy.get();
     // Flush the exact written range (non-coherent host memory only) and drop
     // temporary mappings before the copies are submitted.
     for (size_t i = 0; i < staging.size(); ++i)
@@ -285,6 +286,31 @@ void upload_resident_batch_vulkan(
 void update_resident_vulkan(int64_t handle, torch::Tensor tensor,
                             int64_t offset) {
     upload_resident_batch_vulkan({handle}, {tensor}, {offset});
+}
+
+// One call, N slabs: allocate N pooled device destinations, fill the N
+// pooled staging buffers, record the N copies in ONE command buffer and
+// submit once. Amortizes the per-upload pybind crossing, device alloc and
+// submit/fence over N slabs instead of paying each per slab - the
+// engine's per-expert gate/up/down group (or a layer's miss group)
+// becomes one call instead of N x upload_resident. Tensors may have
+// different sizes; each gets its own handle.
+std::vector<int64_t> upload_resident_multi_vulkan(
+    const std::vector<torch::Tensor>& tensors) {
+    std::vector<int64_t> handles;
+    handles.reserve(tensors.size());
+    for (const auto& t : tensors) {
+        TORCH_CHECK(t.device().is_cpu(),
+                    "resident upload: tensor must be on CPU");
+        TORCH_CHECK(t.numel() >= 0, "resident upload: negative element count");
+        handles.push_back(allocate_resident_vulkan(
+            (int64_t)(t.numel() * t.element_size())));
+    }
+    if (!handles.empty()) {
+        std::vector<int64_t> offsets(handles.size(), 0);
+        upload_resident_batch_vulkan(handles, tensors, offsets);
+    }
+    return handles;
 }
 
 // Forward: descriptor pool lives with the pool infra below.
@@ -338,14 +364,15 @@ static void desc_cache_clear() {
 void free_resident_vulkan(int64_t handle) {
     auto it = g_resident.find(handle);
     if (it == g_resident.end()) return;
-    auto& ctx = get_ctx();
-    vku::destroy_buffer(ctx, it->second);
+    vku::Buffer buf = it->second;
     g_resident.erase(it);
-    // The destroyed VkBuffer may be referenced by cached descriptor sets;
-    // purge the cache so no dangling set is ever bound (task #12 opt).
-    // Pooled expert handles are NOT freed (reused in place), so steady-
-    // state decode never pays this purge.
-    if (!g_desc_cache.empty()) desc_cache_clear();
+    // Device buffers recycle through the pool when there is room (cached
+    // descriptor sets stay valid - the VkBuffer is still alive and the
+    // next upload is fence-ordered before any dispatch can read it). Only
+    // a DESTROYED VkBuffer can dangle in the desc cache, so purge exactly
+    // when the pool had to destroy (oversized or free list full).
+    if (get_pool().release_device(buf) && !g_desc_cache.empty())
+        desc_cache_clear();
 }
 
 int64_t resident_bytes_total_vulkan() {
@@ -1663,6 +1690,75 @@ static void batch_upload_vulkan(int64_t handle, torch::Tensor tensor,
     g_batch.uploads.push_back(staging);
 }
 
+// One crossing, N recorded copies (open-batch mirror of
+// upload_resident_multi): N pooled staging buffers are filled serially
+// (thread spawn loses to the ~30 us slab memcpy), one hazard check covers
+// the union of the destinations (a same-buffer WAW group costs one
+// barrier, not one per copy), then the copies are recorded back to back.
+// Ranges must be distinct, exactly like N separate batch_upload calls to
+// non-overlapping offsets. With no open batch this falls back to the
+// synchronous upload_resident_batch path, same as batch_upload does.
+static void batch_upload_multi_vulkan(
+    const std::vector<int64_t>& handles,
+    const std::vector<torch::Tensor>& tensors,
+    const std::vector<int64_t>& offsets) {
+    TORCH_CHECK(handles.size() == tensors.size(),
+                "handles/tensors size mismatch");
+    TORCH_CHECK(handles.size() == offsets.size(),
+                "handles/offsets size mismatch");
+    if (handles.empty()) return;
+    if (!g_batch.active) {
+        upload_resident_batch_vulkan(handles, tensors, offsets);
+        return;
+    }
+    auto& ctx = get_ctx();
+    const size_t n = tensors.size();
+    std::vector<torch::Tensor> contiguous;
+    std::vector<vku::Buffer> staging(n);
+    std::vector<void*> mapped(n);
+    std::vector<size_t> bytes(n);
+    std::vector<VkBuffer> dsts(n);
+    contiguous.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        TORCH_CHECK(tensors[i].device().is_cpu(),
+                    "batch upload tensor must be on CPU");
+        TORCH_CHECK(offsets[i] >= 0, "batch upload offset must be non-negative");
+        auto it = g_resident.find(handles[i]);
+        TORCH_CHECK(it != g_resident.end(),
+                    "resident buffer handle not found: ", handles[i]);
+        contiguous.push_back(tensors[i].contiguous());
+        size_t nb = (size_t)contiguous.back().numel()
+                    * contiguous.back().element_size();
+        TORCH_CHECK((size_t)offsets[i] + nb <= (size_t)it->second.size,
+                    "batch upload exceeds resident capacity");
+        bytes[i] = nb;
+        dsts[i] = it->second.buf;
+        staging[i] = get_pool().acquire_host(nb);
+        mapped[i] = vku::host_write_begin(ctx, staging[i], nb);
+    }
+    // Serial memcpy, NOT std::async: thread spawn dominates the ~30 us
+    // slab memcpy at these sizes (measured; see upload_resident_batch).
+    for (size_t i = 0; i < n; ++i)
+        std::memcpy(mapped[i], contiguous[i].data_ptr(), bytes[i]);
+    for (size_t i = 0; i < n; ++i)
+        vku::host_write_end(ctx, staging[i], bytes[i], mapped[i]);
+    // Order the whole group against prior batch accesses at once, then
+    // record the copies; the in-order queue plus the distinct-range
+    // contract makes intra-group barriers unnecessary.
+    std::vector<std::pair<VkBuffer, bool>> touches;
+    touches.reserve(n);
+    for (size_t i = 0; i < n; ++i) touches.emplace_back(dsts[i], true);
+    batch_ensure_ordered(touches);
+    for (size_t i = 0; i < n; ++i) {
+        VkBufferCopy c{};
+        c.srcOffset = 0;
+        c.dstOffset = (VkDeviceSize)offsets[i];
+        c.size = (VkDeviceSize)bytes[i];
+        vkCmdCopyBuffer(g_batch.cbuf, staging[i].buf, dsts[i], 1, &c);
+        g_batch.uploads.push_back(std::move(staging[i]));
+    }
+}
+
 static void batch_fill_vulkan(int64_t handle, float value, int64_t count) {
     TORCH_CHECK(g_batch.active, "batch_fill outside an open batch");
     auto& dst = g_resident.at(handle);
@@ -2944,6 +3040,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("upload_resident_batch", &upload_resident_batch_vulkan,
           "Upload CPU tensors into resident-buffer subranges in one submit.",
           py::arg("handles"), py::arg("tensors"), py::arg("offsets"));
+    m.def("upload_resident_multi", &upload_resident_multi_vulkan,
+          "Upload CPU tensors into N fresh pooled resident buffers with one "
+          "staging pass and one submit. Returns the N int64 handles; tensor "
+          "sizes may differ.",
+          py::arg("tensors"));
     m.def("free_resident", &free_resident_vulkan,
           "Free the persistent buffer identified by handle. No-op if unknown.",
           py::arg("handle"));
@@ -3164,6 +3265,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("batch_upload", &batch_upload_vulkan,
           "Record a host->device copy into the open batch.",
           py::arg("handle"), py::arg("tensor"), py::arg("offset") = 0);
+    m.def("batch_upload_multi", &batch_upload_multi_vulkan,
+          "Record N host->device copies into the open batch in one crossing "
+          "(one hazard check, one barrier group; falls back to a single "
+          "sync submit when no batch is open). Ranges must be distinct.",
+          py::arg("handles"), py::arg("tensors"), py::arg("offsets"));
     m.def("batch_fill", &batch_fill_vulkan,
           "Record a float fill (vkCmdFillBuffer) into the open batch.",
           py::arg("handle"), py::arg("value"), py::arg("count"));
