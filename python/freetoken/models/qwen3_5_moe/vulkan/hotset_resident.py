@@ -2,13 +2,19 @@
 
 Why this exists
 ---------------
-Serving the CyberTiel GGUF today moves ~604 MB of packed expert bytes over
-PCIe per generated token (8 of 256 experts x 40 layers x 3 matrices), and
-the measured H2D path only sustains ~4.7-5.7 GB/s, so expert traffic is
-the decode wall. A router-locality study measured that routing concentrates
-on a small per-layer working set, so the frequent experts can be PINNED in
-VRAM once at init and never evicted: the per-token path then only streams
+Serving the CyberTiel GGUF moves ~604 MB of packed expert bytes over PCIe
+per generated token (8 of 256 experts x 40 layers x 3 matrices), so expert
+traffic is the decode cost. A router-locality study measured that routing
+concentrates on a small per-layer working set, which suggests PINNING the
+frequent experts in VRAM once at init so the per-token path only streams
 the experts outside the hot set.
+
+**Measured: identity-correct, but not a speed win - hence the opt-in
+default (`FTV_GGUF_HOTSET=0`).** The plain LRU already hits 85.8% of
+routed requests at ~83.7 MiB/token (66.3% request / 66.0% byte replay of
+the table on the merged real-text trace), and pinning the table's 2925 MiB
+carves that out of the same `FTV_EXP_CACHE_MB` budget, regressing the LRU
+hit rate to 59.5%. Details in ``freetoken.models.gguf.hotset``.
 
 This module adds that pinning on top of ``ResidentGGUF`` WITHOUT touching
 it: ``HotsetResidentGGUF`` is a subclass that
@@ -35,7 +41,13 @@ hot (layer, expert) instead of 3; ``FTV_GGUF_HOTSET_KEYS`` selects
 ``both`` (default) / ``batched`` / ``sequential`` when VRAM is tight.
 
 Env knobs (all read at construction):
-    FTV_GGUF_HOTSET        1 (default) pin on init; 0 = plain ResidentGGUF
+    FTV_GGUF_HOTSET        0 (default; opt-in) pin on init; the pin is
+                           identity-correct but NOT a speed win - the plain
+                           LRU already hits 85.8% of routed requests at
+                           ~83.7 MiB/token (66.3% table replay on the merged
+                           real-text trace), and pinning the table's 2925
+                           MiB steals that LRU budget and regresses the hit
+                           rate to 59.5%. See models/gguf/hotset.py.
     FTV_GGUF_HOTSET_MB     pin budget in MiB (default 4096; clamped to
                            FTV_EXP_CACHE_MB so the total never grows)
     FTV_GGUF_HOTSET_TABLE  table .npz path (default: the shipped

@@ -51,6 +51,10 @@ _KQUANT_OP = {
     "q8_0": "linear_q8_0_resident_io",
 }
 
+# Expert-LRU default for this decoder when FTV_EXP_CACHE_MB is unset; see
+# the measurement note in __init__ (VRAM headroom on an 8 GB card).
+_GGUF_CACHE_MB_DEFAULT = 2048
+
 
 class _GgufPinned:
     """One resident dense matrix pinned in VRAM, with its source dtype."""
@@ -84,15 +88,19 @@ class ResidentGGUF(GgufBatchedMixin, ResidentNVFP4):
         # host-dequant BF16 path (the golden reference). Read before the base
         # init so _pin_gguf sees the same mode when it pins.
         self._packed_kq = os.environ.get("FTV_GGUF_PACKED", "1").strip() != "0"
-        # Batched decode path (gguf_batched.py). OFF by default: it must first
-        # reproduce the sequential path's greedy output (it does not yet), so
-        # FTV_GGUF_BATCHED=1 opts in. FTV_GGUF_BATCHED=0 also pins every fp16
-        # weight at its native dtype and makes generate(batched=True) downgrade
-        # to the sequential decoder.
+        # Batched decode path (gguf_batched.py). ON by default: the
+        # batch_kquant_io hazard fix (Y is WRITE for every kind; "plain" and
+        # "gateup" used to declare it READ while the shaders wrote it) made
+        # it reproduce the sequential greedy output, and it measures ~3.4x
+        # faster (fork2 gate: seq-vs-batched maxdiff 4.530e-06 under the
+        # 1e-5 bound, batched-vs-batched2 bit-exact 0.0). FTV_GGUF_BATCHED=0
+        # restores the sequential decoder (and pins every fp16 weight at its
+        # native dtype); generate(batched=True) then downgrades with a
+        # printed warning.
         # Read before the base init so _pin_gguf's fp16->fp32 widening of
         # the k/v pins matches the mode the decode loop will run in.
         self._gguf_batched = (
-            os.environ.get("FTV_GGUF_BATCHED", "0").strip() != "0"
+            os.environ.get("FTV_GGUF_BATCHED", "1").strip() != "0"
         )
         # Arena/spec pack drive NVFP4-packed-only kernels; force them off for
         # this class even when the ambient env opts in (restored right after,
@@ -101,6 +109,15 @@ class ResidentGGUF(GgufBatchedMixin, ResidentNVFP4):
 
         os.environ["FTV_EXP_ARENA"] = "0"
         os.environ["FTV_SPEC_PACK"] = "0"
+        # The code-wide expert-cache default (4096) overcommits an 8 GB card
+        # here: 3781 MiB of pinned dense + ~1 GiB of per-layer scratch + 4096
+        # + ~0.8 GiB of driver overhead saturates VRAM at 8167 of 8176 MiB
+        # and RADV silently spills the overflow into GTT. 2048 saturates at
+        # ~7010 MiB with ~1.1 GiB of headroom; pass FTV_EXP_CACHE_MB
+        # explicitly to trade headroom for hit rate.
+        saved_cache = os.environ.get("FTV_EXP_CACHE_MB")
+        if not (saved_cache or "").strip():
+            os.environ["FTV_EXP_CACHE_MB"] = str(_GGUF_CACHE_MB_DEFAULT)
         try:
             super().__init__(model_path, ext, max_len=max_len, kv_dtype=kv_dtype)
         finally:
@@ -109,6 +126,10 @@ class ResidentGGUF(GgufBatchedMixin, ResidentNVFP4):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+            if saved_cache is None:
+                os.environ.pop("FTV_EXP_CACHE_MB", None)
+            else:
+                os.environ["FTV_EXP_CACHE_MB"] = saved_cache
 
     # -- weight source ----------------------------------------------------
     def _open(self, model_dir):

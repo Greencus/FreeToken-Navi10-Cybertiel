@@ -5,11 +5,24 @@ Why this exists
 A router-locality study on the CyberTiel GGUF (218-token prompt, top-8 for
 all 40 layers; see the module doc of the builder below) measured that only
 ~15 distinct experts per layer are ever selected (min 10, max 20 of 256),
-and that a per-layer LRU with 16 slots already hits 99.2% of routed
-experts. The routed-expert traffic is therefore almost entirely avoidable:
-pinning the frequent experts in VRAM collapses the ~604 MB/token of expert
-H2D traffic (8/256 experts x 40 layers x 3 matrices) to the few misses
-outside the hot set.
+so the routed-expert traffic looks pin-able: pinning the frequent experts
+in VRAM would collapse the ~604 MB/token of expert H2D traffic (8/256
+experts x 40 layers x 3 matrices) to the few misses outside the hot set.
+
+**Measured outcome: identity-correct, but NOT a performance win, which is
+why the pin ships opt-in (`FTV_GGUF_HOTSET=0` default).** The number this
+module's first draft quoted - a per-layer LRU with 16 slots hitting 99.2%
+of routed experts - came from ONE repeated 320-token prompt. On real text
+the plain LRU already delivers an **85.8% request hit rate and ~83.7
+MiB/token** of expert traffic at the default cache budget, and on the
+merged real-text trace (repeated 320-tok + unique 218-tok, the trace the
+shipped table was built from) the table's own replay is **66.3% by request
+and 66.0% by packed bytes**, not 99.2%. Pinning the table's hot set (2925
+MiB on this file) carves that out of the same `FTV_EXP_CACHE_MB` budget,
+so the LRU region shrinks and its hit rate regresses to **59.5%** - the
+pin trades LRU capacity for hit certainty and loses. Keep the table for
+experiments; do not enable the pin for speed without re-measuring on the
+workload you care about.
 
 This module is the TABLE layer, GPU-agnostic: it builds, stores and replays
 the per-layer ranked hot-expert lists. The runtime that consumes the table

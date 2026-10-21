@@ -200,11 +200,13 @@ modified), so `test_batched_fork2.py` and `test_gdn_kernel.py` still gate the
 paths MTP reuses.
 
 With the packed K-quant path as the weight path,
-`FREETOKEN_TEST_MODEL_GGUF=<path> FREETOKEN_TEST_MTP_TOKENS=12 PYTHONPATH=python
-pytest tests/kernel/vulkan tests/vulkan -q` -> **45 passed, 4 skipped in
-194.5 s**; the 4 skips are the safetensors/gpt-oss checkpoint gates whose
-checkpoints are not on this machine. The A/B numbers in section 7 were taken
-with `tests/vulkan/bench_mtp.py`, which is the same code path.
+`FREETOKEN_TEST_MODEL_GGUF=<path> PYTHONPATH=python pytest tests/vulkan
+tests/gguf_vulkan tests/kernel/vulkan -q` -> **120 passed, 5 skipped in
+414-465 s** (2026-10-21, defaults as shipped: `FTV_GGUF_BATCHED=1`,
+`FTV_EXP_CACHE_MB=2048`); the 5 skips are the safetensors/gpt-oss checkpoint
+gates whose checkpoints are not on this machine. `tests/vulkan/test_mtp.py`
+alone is 4 passed. The A/B numbers in section 7 were taken with
+`tests/vulkan/bench_mtp.py`, which is the same code path.
 
 ## 7. Measured results (RX 5700 XT, RADV, CyberTiel GGUF, batch 1)
 
@@ -330,6 +332,33 @@ at `n_max=5`, whose wider verify rows are the peak).
   per token on the sequential path), which is why the ideal `k/(k+1)` is not
   reached yet.
 
+### On the batched decode base (2026-10-21, the current default)
+
+The tables above predate two changes: the batched decode path became the
+default (`FTV_GGUF_BATCHED=1`, see [kquant-kernels.md](kquant-kernels.md))
+and the measurements below were taken with a **warm page cache** on a quiet
+box, arms back to back inside one process (median of 3 rounds, whole
+`generate()` including the 14-token prefill, `n_max=3 p_min=0.25`,
+`/tmp/opencode/closeout_mtp.py`).
+
+| base | non-speculative baseline | with MTP | ratio | identity |
+| --- | --- | --- | --- | --- |
+| batched (`FTV_GGUF_BATCHED=1`, default) | 292.8 ms/tok = **3.42 tok/s** | 868.9 ms/tok = 1.15 tok/s | **0.34x** | IDENTICAL (3/3 rounds) |
+| sequential (`FTV_GGUF_BATCHED=0`) | 547.3 ms/tok = 1.83 tok/s | 744.5 ms/tok = 1.34 tok/s | **0.74x** | IDENTICAL (3/3 rounds) |
+
+Accept rate 0.64 (9/14 drafted) in every round of every run, rollbacks 2 per
+16 tokens - the accept machinery is unchanged and correct; what changed is
+the baseline. Phase ms per round on the batched base: verify 7695-7862,
+draft 355-412, catch-up 370-388, rollback 1226-1274.
+
+**Verdict: MTP is token-identical on the batched base but no longer pays on
+either base.** Its verify and catch-up walk the sequential T>1 K-quant lane
+(`_moe_chunk`, per-matrix keys), so a verify round costs about as much as
+`k+1` sequential tokens while committing only `k/(k+1)` of them; the 1.63x
+in the packed-path table above was measured against a 0.51 tok/s baseline
+that no longer exists. Until the T>1 lane gets batched K-quant recorders,
+run `--mtp` for correctness work, not for speed.
+
 
 ## 8. Known limits / follow-ups
 
@@ -352,4 +381,8 @@ at `n_max=5`, whose wider verify rows are the peak).
 - The verify is a *batched* trunk pass, not `k+1` sequential ones. On this
   backend that is the assumption the bench measures (see the batching probe in
   `bench_mtp.py`); if batching stops amortizing dispatch, MTP loses its edge
-  and the gate stays green while the bench shows it.
+  and the gate stays green while the bench shows it. **That has happened**: on
+  the current batched-decode base the verify lane is no longer the fast path,
+  and MTP measures 0.34x the baseline (section 7, "On the batched decode
+  base"). The fix is batched K-quant recorders for the T>1 `_moe_chunk` lane,
+  not a change to the draft/verify/accept logic.

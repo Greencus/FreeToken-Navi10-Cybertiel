@@ -115,46 +115,81 @@ weight is dequantized on the host and a Q4_K expert costs 0.5625 MiB of VRAM
 instead of 2.0 MiB as BF16. `FTV_GGUF_PACKED=0` forces the old host-dequant
 BF16 path.
 
-Measured on the RX 5700 XT (8 GB, RADV, loadavg ~10, decode only, 8 tokens
-after a 4-token warm-up, `tests/vulkan/bench_gguf_packed.py`):
+Decode walks the layers through the **batched command-buffer path** by
+default (`FTV_GGUF_BATCHED=1`): one command buffer per layer carries the
+dense projections, the 8 routed experts (fused gateup-silu + accumulate-down
+via `batch_moe_kquant_record`) and the readbacks, so a token costs ~91
+submits instead of a submit per matrix. The path is **identity-verified**
+against the sequential decoder - the hazard-flag fix in `batch_kquant_io`
+(Y is WRITE for every `kind`; `plain` and `gateup` used to declare it READ
+while the shaders wrote it) is what made it correct - and
+`tests/vulkan/test_batched_fork2.py` measures seq-vs-batched maxdiff
+**4.530e-06** (gate 1e-5), batched-vs-batched2 **bit-exact 0.0**, identical
+argmax, and the reference token ids on the identity prompt.
+`FTV_GGUF_BATCHED=0` restores the sequential per-matrix decoder (and pins
+every fp16 weight at its native dtype).
 
-| Path | decode s/tok | decode tok/s |
-| --- | --- | --- |
-| packed (default) | **1.309** | **0.764** |
-| host-dequant fallback (`FTV_GGUF_PACKED=0`) | 29.7 | 0.034 |
+Measured on the RX 5700 XT (8 GB, RADV, loadavg ~2-5, page cache warm,
+decode only, 8 tokens after a 6-token per-path warm-up; sequential and
+batched arms run back to back inside one process, median of 3 rounds,
+`FTV_EXP_CACHE_MB` at the shipped 2048):
 
-**22x the fallback, and the same token ids on the identity prompt**
-(`[5844, 11, 13358, 11]` for `--max-tokens 4 --seed 1234` through both paths).
-VRAM ends at 7924 MiB resident - lower it with `--cache-mb` if the card has
-other tenants. That is still ~21x short of llama.cpp's 16-17.9 tok/s on the
-same file: the remaining cost is one synchronous submit+fence+readback per
-expert GEMV (~3900 per token), not the weights. The next lever is wrapping the
-8 routed experts of a layer in one `batch_begin`/`batch_submit` and using the
-fused `gateup` + `acc` shaders - see the last-mile notes in
-[kquant-kernels.md](kquant-kernels.md).
+| Path | decode ms/tok | decode tok/s | sync round trips/tok | submits/tok |
+| --- | --- | --- | --- | --- |
+| batched (default) | **110.3-158.2** | **6.3-9.1** | 222-325 | 91 |
+| sequential (`FTV_GGUF_BATCHED=0`) | 462.5-528.2 | 1.9-2.2 | 4246-4338 | 0 |
 
-MTP speculative decode works on top of the packed path:
-`--mtp --mtp-p-min 0.25 --mtp-n-max 3` measured 0.83 tok/s against the 0.51 tok/s
-baseline of the same run (whole `generate()`, prefill included), token-identical
-to the non-speculative greedy path. `n_max 5` measured slower (0.37-0.54 tok/s),
-which is what the fork reports for this model too. The absolute numbers move
-with box load - the non-speculative baseline ran at 0.51, 0.60 and 0.70 tok/s
-on three separate invocations - so always compare inside one run. See
-[mtp.md](mtp.md).
+**3.0-4.3x**, consistent with the 3.43x (149.6 vs 513 ms/tok) of the run
+that promoted the path; the spread is page-cache and box-load noise on a
+shared machine. "Sync round trips" is the engine's per-call synchronous
+stat counter (upload/kernel/download per expert miss and per dense pin);
+the batched path moves almost all of them into the 91 submits.
+
+VRAM is the reason the expert-cache default is 2048: with
+`FTV_EXP_CACHE_MB=4096` the run saturates the card at **8167 of 8176 MiB**
+(over the driver's own 7434 MiB budget), and RADV silently spills the
+overflow into system memory; at 2048 it saturates at **~6998 MiB**, ~1.1 GiB
+of headroom, which also covers `--max-len 8192` (the KV caches are host
+RAM, so context length does not move VRAM). RSS peaks near 15 GiB, almost
+all of it the mmap'd 22.8 GB GGUF's page cache - reclaimable, never a
+private copy. Raise the budget with `--cache-mb` only when the card is
+otherwise idle, and watch `/sys/class/drm/card1/device/mem_info_vram_used`.
+
+The host-dequant fallback (`FTV_GGUF_PACKED=0`) is unchanged and still
+produces the same token ids (`[5844, 11, 13358, 11]` for `--max-tokens 4
+--seed 1234` through both weight paths) at ~29.7 s/tok - **~22x slower than
+the packed sequential path** and ~700x slower than the batched one; it is
+kept as the byte-for-byte reference the gates compare against. llama.cpp's
+Vulkan build on the same file runs 16.4-17.9 tok/s, so the batched path is
+now 1.5-2.5x short of it rather than ~21x - the remaining cost is per-layer
+submit/fence overhead, not the weights (see
+[kquant-kernels.md](kquant-kernels.md)).
+
+**MTP speculative decode is correct on the batched base but does not pay.**
+`--mtp --mtp-p-min 0.25 --mtp-n-max 3` stays token-identical to the
+non-speculative greedy path with `FTV_GGUF_BATCHED=1`, but its verify and
+catch-up walk the sequential T>1 K-quant lane, so it measured **0.34x** the
+batched baseline (1.15 vs 3.4 tok/s, whole `generate()`) and 0.74x the
+sequential one. Use it for correctness work, not speed, until the T>1 lane
+gets its own batched recorders. See [mtp.md](mtp.md).
 
 ### Environment knobs
 
 | Variable | Meaning |
 | --- | --- |
 | `FREETOKEN_VULKAN_SHADERS` | directory holding the compiled `.spv` files |
-| `FTV_EXP_CACHE_MB` | VRAM budget for the expert LRU cache (default 2048) |
-| `FTV_HOST_PACK_MB` | host-side packed-expert cache (default 256) |
-| `FTV_NVFP4_GPU` | `1` uses the NVFP4 GPU kernel, `0` dequantizes on the host to BF16 |
+| `FTV_GGUF_BATCHED` | `1` (default) batched command-buffer decode, `0` sequential per-matrix decode (identity-verified either way) |
 | `FTV_GGUF_PACKED` | `1` (default) serves GGUF experts through the packed K-quant shaders, `0` dequantizes them on the host to BF16 |
+| `FTV_EXP_CACHE_MB` | VRAM budget for the expert LRU cache (code-wide default 4096; `ResidentGGUF` defaults it to **2048** when unset - 4096 overcommits an 8 GB card) |
+| `FTV_HOST_PACK_MB` | host-side packed-expert cache (default 256) |
+| `FTV_GGUF_DEQUANT_CACHE_MB` | host cache for dequantized experts on the `FTV_GGUF_PACKED=0` fallback (default 256) |
+| `FTV_STAGING_MAP` | `1` (default) persistent mapping of host-visible buffers, `0` map/unmap per access, `2` persistent except one-shot sync staging |
+| `FTV_GGUF_HOTSET` | `0` (default) pin the static expert hot set; identity-correct but **not** a speed win (see [kquant-kernels.md](kquant-kernels.md)) |
+| `FTV_NVFP4_GPU` | `1` uses the NVFP4 GPU kernel, `0` dequantizes on the host to BF16 |
 | `FTV_NVFP4_M1` | enable the Wave64 single-wavefront NVFP4 kernel (nonzero number) |
 | `FTV_GPU_ROUTER` | run the router and top-k on the GPU |
-| `FTV_EXP_ARENA` | fixed-slot per-layer expert arena (fused 8-expert MoE dispatch) |
-| `FTV_SPEC_PACK` | speculative host pre-pack daemon for the next token's experts |
+| `FTV_EXP_ARENA` | fixed-slot per-layer expert arena (fused 8-expert MoE dispatch; NVFP4-packed only, forced off for GGUF) |
+| `FTV_SPEC_PACK` | speculative host pre-pack daemon for the next token's experts (NVFP4-packed only, forced off for GGUF) |
 
 ## Hardware notes (RDNA1 / gfx1010)
 
@@ -166,9 +201,16 @@ on three separate invocations - so always compare inside one run. See
   shared arrays produced all-NaN output on RADV/Navi10 even when every input
   was finite. Per-lane recompute, or a single-writer reduction, is the safe
   pattern.
-- **Host staging buffers cannot stay mapped** for the process lifetime on this
-  driver; a persistent mapped staging ring cost a full-range flush per submit
-  and was reverted.
+- **Host-visible buffers are mapped once and stay mapped** (`FTV_STAGING_MAP=1`,
+  the default): per-upload `vkMapMemory`/`vkUnmapMemory` costs ~130 us/MB of
+  driver page-table work on this driver and capped the staging path at ~4-5
+  GB/s. Coherence is handled by exact-range flushes that fire only when the
+  memory type is non-coherent - RADV/Navi10 exposes none (all six host-visible
+  types are HOST_COHERENT), so here they are spec-mandated no-ops and the win
+  is deleting the map/unmap pair (11.5-12.5 GB/s batched/async at 1.77 MB,
+  sync unchanged at ~4.2 GB/s; see [kquant-kernels.md](kquant-kernels.md)).
+  An always-mapped staging *ring* that published N+1 during N was tried and
+  reverted - it cost a full-range flush per submit on this driver.
 
 ## Correctness gates
 
@@ -177,12 +219,21 @@ to the kernels or the decode loop:
 
 | Test | Gate |
 | --- | --- |
-| `test_batched_fork2.py` | same-state fork: sequential vs batched max diff <= 5.5e-06, batched vs batched **bit-exact (0.0)**, identical argmax |
+| `test_batched_fork2.py` | same-state fork: sequential vs batched max diff <= 1e-5 (measured 4.530e-06), batched vs batched **bit-exact (0.0)**, identical argmax; the GGUF variant runs the real `decode_step_batched` |
 | `test_gdn_kernel.py` | GPU GDN conv + recurrence vs the host reference (1e-07) |
-| `test_gpu_router.py` | GPU router: per-layer h2 <= 1e-5, paired (id, renormalized scale) <= 1e-6, >= 50-token argmax, sentinel contract |
-| `test_topk_parity.py` | top-k 256x8 on the GPU vs torch (<= 1e-6) |
-| `test_qwen35_{attn,moe,layer}_parity.py` | layer-level parity |
-| `test_batched_chunked.py` | 30-token chunked generation matches |
+| `test_gguf_batched_synthetic.py` | K-quant batch recorders on synthetic slabs vs the host reference |
+| `test_gguf_parity.py` | GGUF decode vs the host-dequant reference (opt-in via `FREETOKEN_TEST_MODEL_GGUF`) |
+| `test_hotset_resident.py` | hot-set pin is token-identical to the plain LRU |
+| `test_mtp.py` | MTP draft/verify/accept is token-identical to the greedy path |
+| `test_qwen35_moe_parity.py` | MoE layer parity (safetensors checkpoint) |
+| `test_resident_moe.py` | gpt-oss resident MoE |
+| `test_ressl_nvfp4_kernel.py` | NVFP4 kernel parity |
+| `test_vulkan_smoke.py` | rmsnorm / resident linear / batch round trip |
+
+`tests/kernel/vulkan/` holds the shader-level gates (including the K-quant
+goldens) and `tests/gguf_vulkan/` the packed-provider and mapping gates; the
+model-dependent ones need `FREETOKEN_TEST_MODEL_GGUF=<path>`. Full run on
+this box (2026-10-21): **120 passed, 5 skipped in 465 s**.
 
 When bisecting a layer divergence, restore the pristine host state
 (`gdn_state`, `conv_buf`, `k_cache`, `v_cache`, `_seq_len`) at the **top** of

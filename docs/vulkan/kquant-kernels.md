@@ -11,11 +11,16 @@ These shaders remove both costs: the packed GGUF bytes are uploaded verbatim
 and unpacked inside the compute shader, so a weight is never materialized
 outside the file except as the file's own bytes in VRAM.
 
-**Status: wired into the decode loop and measured end-to-end.**
+**Status: wired into the decode loop and measured end-to-end, batched.**
 `python/freetoken/models/qwen3_5_moe/vulkan/gguf_resident.py` serves experts
 through the packed shaders by default; `FTV_GGUF_PACKED=0` falls back to the
-old host-dequant BF16 path. The two paths produce **identical token ids** on
-the greedy identity prompt (see [Wired into the decode loop](#wired-into-the-decode-loop)).
+old host-dequant BF16 path. Decode itself runs the **batched command-buffer
+path by default** (`FTV_GGUF_BATCHED=1`, `gguf_batched.py`): one command
+buffer per layer records the dense projections, the fused `gateup` + `acc`
+expert dispatches and the readbacks, and `batch_moe_kquant_record` does a
+whole layer's MoE in one pybind crossing. The two weight paths and both
+decode modes produce the same token ids on the greedy identity prompt (see
+[Wired into the decode loop](#wired-into-the-decode-loop)).
 
 ## What is in the tree
 
@@ -148,48 +153,76 @@ reproduce the explicit `batch_kquant_io` calls bit-for-bit in tolerance.
 
 ## Wired into the decode loop
 
-Two files carry the wiring, and nothing else:
+Two files carry the sequential wiring, plus the mixin for the batched one:
 
 | Piece | Change |
 | --- | --- |
 | `gguf_provider.py` | `ExpertBank` gained `qtype` / `row_bytes` / `packed_bytes` (keyword-only, default `None`/0, so the existing positional construction still works); `GGUFProvider.expert_bank()` sets them from `kquant_qtype(ggml_type)`, and `expert_packed(layer, proj, expert)` returns the slab |
 | `gguf_resident.py` | `_packed_qtype()` decides the lane, `_expert_handle()` uploads the packed slab on a miss (or `expert_bf16` when the lane is off), `_expert_affine{,_batch}()` dispatch `linear_q{4k,5k,8_0}_resident_io` instead of `linear_bf16_resident_io` |
+| `gguf_batched.py` | `GgufBatchedMixin` (first in `ResidentGGUF`'s MRO) overrides the three batch record hooks: dtype-dispatching dense records, and `_record_moe_in` -> `batch_moe_kquant_record` (8 fused gateup-silu + 8 accumulated downs per layer, router value folded into each acc `gscale`) |
 
 `FTV_GGUF_PACKED` (default `1`) selects the lane; `0` forces the old
 host-dequant BF16 path, unchanged. Both reach the experts only through
 `model.expert_mats` + `_moe_step` / `_moe_chunk`, which is also how the MTP
 head reads them, so the speculative path picks the packed lane up for free.
 
-Only the plain `resident` shader is used today: each routed expert is still
-three synchronous round trips (upload the token row, GEMV, download the
-result). The fused `gateup` + `acc` shaders, `batch_kquant_io` and
-`batch_moe_kquant_record` are built, shader-tested and **not yet wired** -
-they are the remaining lever (see the last-mile notes below).
+The sequential lane uses the plain `resident` shader (three synchronous
+round trips per expert affine). The batched lane (`FTV_GGUF_BATCHED=1`,
+default) uses `gateup` + `acc` through `batch_kquant_io` /
+`batch_moe_kquant_record` inside one open batch per layer - that is the
+difference between ~4300 and ~260 synchronous round trips per token.
+
+**What made the batched lane correct.** `batch_kquant_io` declares its
+hazard flags per `kind`, and the `plain` and `gateup` arms used to declare
+`Y` **READ** while the shaders write it; only `acc` was WRITE. The engine's
+scoped barriers therefore ordered those writes away on some interleavings,
+and the batched walk diverged from the sequential one. Making `Y` WRITE for
+every kind (matching `batch_nvfp4_io`) fixed it: the feared sync-path
+collapse did not reproduce, all 40 layers match at 0 or ~1e-7, and
+`test_batched_fork2.py` measures seq-vs-batched **4.530e-06** (gate 1e-5),
+batched-vs-batched2 **bit-exact 0.0**, identical argmax.
 
 ### Measured end-to-end (RX 5700 XT, 41-block CyberTiel GGUF)
 
-`python tests/vulkan/bench_gguf_packed.py --tokens 8 --warmup 4` times the
-decode loop only (prefill is measured separately); `tests/vulkan/bench_mtp.py`
-times whole `generate()` calls including the 14-token prefill.
+`/tmp/opencode/closeout_bench.py` (2026-10-21; the same recipe as
+`tests/vulkan/bench_gguf_packed.py`, extended so the sequential and batched
+arms run **back to back inside one process** with a per-arm warm-up, median
+of 3 rounds, decode only, warm page cache, loadavg ~2-5) times the decode
+loop only (prefill is measured separately).
 
-| Path | decode s/tok | decode tok/s | host dequant |
-| --- | --- | --- | --- |
-| packed (`FTV_GGUF_PACKED=1`, default) | **1.309** | **0.764** | none |
-| host-dequant fallback (`FTV_GGUF_PACKED=0`) | 29.7 | 0.034 | every cache miss |
+At the shipped defaults (`FTV_GGUF_BATCHED=1`, `FTV_EXP_CACHE_MB=2048`):
 
-That is **22x** the fallback. Prefill of the 14-token prompt: 16.1 s cold
-(the expert LRU is empty, so it pays the miss path) - the packed lane removes
-the dequant from that path too. VRAM at the end of the packed run: 7924 MiB
-resident (`--cache-mb` lowers it; the pinned dense tensors alone are 3741 MiB);
-RSS peak 10.4 GiB, most of which is the mmap'd file.
+| Path | decode ms/tok | decode tok/s | sync round trips/tok | submits/tok |
+| --- | --- | --- | --- | --- |
+| batched (default) | **110.3-158.2** | **6.3-9.1** | 222-325 | 91 |
+| sequential (`FTV_GGUF_BATCHED=0`) | 462.5-528.2 | 1.9-2.2 | 4246-4338 | 0 |
 
-The `report_stats()` split for the packed run says it outright: `exp_packed`
-6.04 s / 6879 calls (slab view) and `exp_up` 7.24 s / 6879 calls (upload) are
-present, and **`exp_dequant` does not appear at all**. Per expert affine:
-0.317 ms token upload + 0.164 ms GEMV + 0.159 ms result download, i.e. the
-cost is now the ~3900 synchronous round trips per token, not the weights.
+**3.0-4.3x**, the same ratio as the 3.43x (149.6 vs 513 ms/tok) of the run
+that promoted the path. With the expert budget raised to 4096 the batched
+path reaches 89.9-132.6 ms/tok (7.5-11.1 tok/s) at 127-166 round
+trips/token - but that budget saturates the card at 8167 of 8176 MiB and
+RADV spills the overflow into system memory, which is why the GGUF decoder
+defaults it to 2048 (peak ~6998 MiB, ~1.1 GiB of headroom; the KV caches
+are host RAM, so `--max-len 8192` does not move VRAM).
 
-**Token identity.** The same prompt through both paths:
+The host-dequant fallback (`FTV_GGUF_PACKED=0`) is unchanged at ~29.7
+s/tok and still produces the same token ids. That is ~22x slower than the
+packed sequential path and ~700x slower than the batched one; it is kept
+as the byte-for-byte reference the golden tests compare against, not as a
+runnable option (its `exp_dequant` dominates every cache miss).
+
+Prefill of the 14-token prompt: 4.1-5.0 s warm (the packed lane removes the
+host dequant from that path too; a cold LRU pays the miss path on top).
+RSS peaks near 15 GiB across a multi-round bench, almost all of it the
+mmap'd 22.8 GB GGUF's page cache - reclaimable, never a private copy.
+
+The `report_stats()` split says it outright: `exp_dequant` does not appear
+at all on the packed path. On the sequential lane the per-expert affine is
+still 0.317 ms token upload + 0.164 ms GEMV + 0.159 ms result download,
+i.e. the cost is the synchronous round trips, not the weights; the batched
+lane moves those round trips into the 91 submits a token costs.
+
+**Token identity.** The same prompt through both weight paths:
 
 ```
 --prompt "Name three primary colors." --max-tokens 4 --temperature 0 --seed 1234
@@ -197,32 +230,35 @@ FTV_GGUF_PACKED=1  ->  token_ids: [5844, 11, 13358, 11]   "Red, yellow,"
 FTV_GGUF_PACKED=0  ->  token_ids: [5844, 11, 13358, 11]   "Red, yellow,"
 ```
 
-identical. This is the expected outcome rather than a coincidence: the shader
-unpacks to fp32 and the fallback dequantizes to BF16, so the two differ in the
-last mantissa bits of every weight (~2^-8) - the greedy argmax has to be
-robust to that, and on this prompt it is. Treat the identity as a gate, not as
-a proof of bit-equality.
+identical, and the batched decode mode reproduces the sequential one's ids
+as well (the `fork2` gate above). This is the expected outcome rather than
+a coincidence: the shader unpacks to fp32 and the fallback dequantizes to
+BF16, so the two differ in the last mantissa bits of every weight (~2^-8) -
+the greedy argmax has to be robust to that, and on this prompt it is. Treat
+the identity as a gate, not as a proof of bit-equality.
 
-### Last mile (not done)
+### Last mile: done, and what is left
 
-llama.cpp runs the same file at 16.4-17.9 tok/s, so the packed path is still
-~21x short, and the gap is dispatch, not math: the GPU does ~0.16 s/step of
-GEMV work while the wall clock is 1.31 s. Closing it means (in order):
+llama.cpp runs the same file at 16.4-17.9 tok/s. The batched path closed
+most of the old ~21x gap (now 1.5-2.5x); the three steps that did it, in
+order, were:
 
 1. Wrap the 8 routed experts of `_moe_step` in one `batch_begin` /
-   `batch_submit` (`batch_upload`, `batch_kquant_io`, `batch_download`),
-   collapsing 24 round trips per layer into 1 submit + 8 readbacks. The batch
-   engine is proven bit-exact by the fork (`bat-vs-bat2 = 0.0`) and by
-   `test_batch_acc_sums_experts`.
+   `batch_submit` (`batch_upload`, `batch_kquant_io`, `batch_download`) -
+   done, via `GgufBatchedMixin` (`_record_moe_in`). Proven bit-exact by the
+   fork (`bat-vs-bat2 = 0.0`) and by `test_batch_acc_sums_experts`.
 2. Bundle gate+up per expert with `packed_gate_up_expert` and dispatch the
    `gateup` shader, then feed the resident silu slot straight into the `acc`
-   kernel for the down GEMV - two dispatches per expert, no host silu, no
-   second upload.
-3. Only after those: a persistent arena for expert slots, as the NVFP4 path
-   already does.
+   kernel for the down GEMV - done (`batch_moe_kquant_record`).
+3. Persistent mapping of the host-visible staging/scratch buffers
+   (`FTV_STAGING_MAP=1`) - done; see the bandwidth section below.
 
-Estimated floor with (1)+(2) done: ~0.5-0.6 s/tok. Do not claim more than that
-without measuring.
+What is left is per-layer submit/fence overhead on the main queue (91
+submits/token) plus the attention host math; the expert bytes are no longer
+in the wall. The next levers, in order of expected value: overlap the
+per-layer H2D with the previous layer's compute (async upload queue hooks
+already exist in `ext_module.cpp`), move the attention KV math onto the GPU
+(it is host-side today), and only then re-tune kernels.
 
 ## Measured (RX 5700 XT, RADV, `glslc --target-env=vulkan1.2`)
 
@@ -253,6 +289,25 @@ Bandwidth, resident upload + submit (medians):
 | 0.5625 MiB (one Q4_K expert matrix) | 0.164 ms |
 | 2.25 MiB (4 matrices) | 0.505 ms |
 | 9 MiB (16 matrices) | 1.907 ms |
+
+**H2D after the persistent-mapping rewrite** (`vk_util.hpp`: `Buffer` gains
+`mapped` + `host_coherent`; `make_host_ssbo` prefers a non-coherent
+HOST_VISIBLE type and falls back to coherent; `host_write_begin`/
+`host_write_end`/`download` flush exactly the touched range when - and only
+when - the memory is non-coherent; all five host-visible paths route through
+the hooks). At a 1.77 MB transfer:
+
+| path | before (map/unmap per use) | after (persistent map) |
+| --- | --- | --- |
+| sync one-shot | 4.14 GB/s | 4.19-4.33 GB/s (unchanged) |
+| batched / async queue | 5.4 GB/s | **11.5-12.5 GB/s (2.1-2.3x)** |
+
+On this box RADV exposes **no** non-coherent host type (all six host-visible
+types are HOST_COHERENT), so the flushes are spec-mandated no-ops here and
+the entire win is deleting the per-upload `vkMapMemory`/`vkUnmapMemory`
+(~130 us/MB of driver page-table work). The knob is `FTV_STAGING_MAP`:
+`1` (default) persistent mapping everywhere, `0` the old per-use map/unmap,
+`2` persistent except `upload_via_staging`'s one-shot sync staging.
 
 At that rate the packed 13.5 MiB/token costs about 2.5 ms of upload against
 5.1 ms for 27 MiB of BF16 - and, unlike the host path, the unpack work is on
