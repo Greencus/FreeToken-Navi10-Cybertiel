@@ -1,0 +1,34 @@
+#version 450
+// TorchAO-affine (oQ4e) resident matvec: Y[T,N] = X[T,K] @ W[K,N].
+// W is a little-endian flat bit-stream: U32 packed[N, words] with
+// words = ceil(K*bits/32); value k occupies bits [k*bits,(k+1)*bits).
+// Scales/biases are BF16 [N, K/group_size]; dequant: w = q*scale + bias
+// (the stored bias is pre-negated, bias = -zero_point * scale).
+// Uniform across bits in {4,5,6,8} and any group_size dividing K.
+// Scalar fallback path for GPUs without cooperative-matrix support.
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer QBuf { uint packed[]; };
+layout(std430,binding=1) readonly buffer SBuf { uint16_t scales[]; };
+layout(std430,binding=2) readonly buffer BBuf { uint16_t biases[]; };
+layout(std430,binding=3) readonly buffer XBuf { float X[]; };
+layout(std430,binding=4) writeonly buffer YBuf { float Y[]; };
+layout(push_constant) uniform P { uint T;uint N;uint K;uint bits;uint group_size;uint words;uint ngroups; } p;
+float bf16(uint bits){return uintBitsToFloat(bits<<16u);}
+void main(){
+uint n=gl_WorkGroupID.x*128u+gl_LocalInvocationID.x,t=gl_WorkGroupID.y;
+if(n>=p.N||t>=p.T)return;
+uint mask=(p.bits>=32u)?0xFFFFFFFFu:((1u<<p.bits)-1u);
+uint row=n*p.words,sbase=n*p.ngroups;
+float acc=0.0;
+for(uint k=0u;k<p.K;++k){
+uint bit=k*p.bits,w=bit>>5u,s=bit&31u;
+uint q=(packed[row+w]>>s)&mask;
+if(s+p.bits>32u){uint spill=s+p.bits-32u;q|=(packed[row+w+1u]&((1u<<spill)-1u))<<(32u-s);}
+uint g=k/p.group_size;
+float wfp=float(q)*bf16(uint(scales[sbase+g]))+bf16(uint(biases[sbase+g]));
+acc=fma(X[t*p.K+k],wfp,acc);
+}
+Y[t*p.N+n]=acc;
+}

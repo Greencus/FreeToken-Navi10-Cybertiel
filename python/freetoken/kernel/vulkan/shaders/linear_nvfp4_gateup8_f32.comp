@@ -1,0 +1,105 @@
+#version 450
+// Fused 8-expert gate+up with SiLU fold (MUL_MAT_ID-style, arena).
+// ONE dispatch replaces the 8 per-expert gateup dispatches of a layer
+// (task: fused MoE dispatches).  Grid = (N gate rows, 8 experts): the
+// workgroup (n, j) computes expert j's gate[n] and up[n] from the
+// per-layer fused arena and writes silu(gate)*up into rows
+// [j*N, (j+1)*N) of the caller's h_silu_all scratch.
+//
+// Numerics are bit-transparent vs the 8-dispatch path: for each (j, n)
+// the row dot uses the EXACT lane/word split, scale-group indexing and
+// FMA chain of linear_nvfp4_gateup_silu_f32 (identical wbase/srow math,
+// identical two-tree gate+up reduction, identical silu = s/(1+exp(-s))).
+// The only differences are source of the slot row offset (Ids[j] x
+// rows_per_slot instead of the push-constant slot0) and the output row
+// (j*N + n inside one shared silu_all buffer instead of row n of a
+// per-expert slot buffer).  Both are pure address math — same values,
+// same order, same result.
+//
+// Bindings:
+//   0 = arena packed bytes  (fused wf: gate rows 0..N-1, up rows N..2N-1
+//                            per slot, slot stride = rows_per_slot rows)
+//   1 = arena scales u32    (sf, slots stacked the same way)
+//   2 = X                   (h_x_fused, fp32 [T, K])
+//   3 = Y                   (h_silu_all, fp32 [8*N]; expert j -> [j*N ..))
+//   4 = Ids u32[8]          (expert j -> slot index)
+//   5 = Gs   float[16]      (gateup fp32 global scale at Gs[j])
+// Push: {T, N, K, wpr, ng32, rows_per_slot} (24 B).
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer QBuf { uint packed32[]; };
+layout(std430,binding=1) readonly buffer SBuf { uint scales32[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) writeonly buffer YBuf { float Y[]; };
+layout(std430,binding=4) readonly buffer IBuf { uint Ids[]; };
+layout(std430,binding=5) readonly buffer GBuf { float Gs[]; };
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint wpr; uint ng32; uint rows_per_slot;
+} p;
+shared float e2m1_lut[16];
+shared float e4m3_lut[256];
+shared float partial[128];
+shared float partial_u[128];
+float e2m1_dec(uint v){
+uint s=v>>3u,e=(v>>1u)&3u,m=v&1u;
+float a=(e==0u)?(float(m)*0.5):(exp2(float(e)-1.0)*(1.0+float(m)*0.5));
+return (s==1u)?-a:a;
+}
+float e4m3_dec(uint b){
+uint s=b>>7u,e=(b>>3u)&15u,m=b&7u;
+if(e==0u){float a=exp2(-6.0)*float(m)/8.0;return (s==1u)?-a:a;}
+if(e==15u&&m==7u)return 0.0;
+float a=exp2(float(e)-7.0)*(1.0+float(m)/8.0);
+return (s==1u)?-a:a;
+}
+void main(){
+uint li=gl_LocalInvocationID.x;
+for(uint i=li;i<16u;i+=128u)e2m1_lut[i]=e2m1_dec(i);
+for(uint i=li;i<256u;i+=128u)e4m3_lut[i]=e4m3_dec(i);
+barrier();
+uint j=gl_WorkGroupID.y;
+uint n=gl_WorkGroupID.x;
+if(n>=p.N||j>=8u)return;
+float gs=Gs[j];
+uint slot=Ids[j];
+uint slot0=slot*p.rows_per_slot;
+// Row n = gate, row n+N = up, in the STACKED bundle (per-expert math).
+uint wbase_g=(slot0+n)*p.wpr,srow_g=(slot0+n)*p.ng32;
+uint wbase_u=(slot0+n+p.N)*p.wpr,srow_u=(slot0+n+p.N)*p.ng32;
+float acc_g=0.0,acc_u=0.0;
+for(uint w=li;w<p.wpr;w+=128u){
+uint wd_g=packed32[wbase_g+w];
+uint wd_u=packed32[wbase_u+w];
+uint g=(w<<3u)>>4u;                 // scale group index for this word
+uint swg=scales32[srow_g+(g>>2u)];
+uint swu=scales32[srow_u+(g>>2u)];
+float sg=e4m3_lut[(swg>>(8u*(g&3u)))&255u]*gs;
+float su=e4m3_lut[(swu>>(8u*(g&3u)))&255u]*gs;
+for(uint i=0u;i<4u;++i){
+uint kpos=(w<<3u)+(i<<1u);
+uint elo=wd_g&15u; wd_g=wd_g>>4u;
+uint ehi=wd_g&15u; wd_g=wd_g>>4u;
+uint elo_u=wd_u&15u; wd_u=wd_u>>4u;
+uint ehi_u=wd_u&15u; wd_u=wd_u>>4u;
+acc_g=fma(X[kpos],sg*e2m1_lut[elo],acc_g);
+acc_g=fma(X[kpos+1u],sg*e2m1_lut[ehi],acc_g);
+acc_u=fma(X[kpos],su*e2m1_lut[elo_u],acc_u);
+acc_u=fma(X[kpos+1u],su*e2m1_lut[ehi_u],acc_u);
+}
+}
+partial[li]=acc_g;
+partial_u[li]=acc_u;
+barrier();
+// Two parallel tree reductions (gate + up) — same as per-expert kernel.
+for(uint stride=64u;stride>0u;stride>>=1u){
+if(li<stride){
+partial[li]+=partial[li+stride];
+partial_u[li]+=partial_u[li+stride];
+}
+barrier();
+}
+if(li==0u){
+float s=partial[0];
+float silu=s/(1.0+exp(-s));
+Y[j*p.N+n]=silu*partial_u[0];
+}
+}

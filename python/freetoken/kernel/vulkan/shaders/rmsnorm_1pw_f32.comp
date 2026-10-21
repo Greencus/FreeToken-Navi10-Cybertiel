@@ -1,0 +1,55 @@
+#version 450
+// rmsnorm_1pw_f32.comp — GPU-resident RMSNorm (GPU-router task, oracle-3 R1).
+//
+// Matches the Qwen3.5 *zero-centered* host contract EXACTLY:
+//     y = x * rsqrt(mean(x^2) + eps) * (1 + w)
+// (NOT the standard rmsnorm_f32 `* w` form — the model checkpoint's norm
+// weights are stored as a delta around 1.0.)
+//
+// Layout: x, y are [N, H] row-major fp32; w is [H] fp32. One workgroup of
+// WG=256 threads per row; tree reduction over H for sum(x^2). This is the
+// proven rmsnorm_f32 structure (single-writer partials, log2 tree reduce,
+// barrier-synced two passes) — the only shared use is the reduction.
+//
+// Dispatch: gx = N rows (one WG per row).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufX { float x[]; };  // [N, H]
+layout(std430, binding = 1) readonly  buffer BufW { float w[]; };  // [H]   (delta weights)
+layout(std430, binding = 2) writeonly buffer BufY { float y[]; };  // [N, H]
+
+layout(push_constant) uniform Params {
+    uint  H;       // hidden dim (elements per row)
+    float eps;
+} params;
+
+shared float partial[256];
+
+void main() {
+    const uint row  = gl_WorkGroupID.x;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint H    = params.H;
+    const uint row_off = row * H;
+
+    // Pass 1: partial sum(x^2) over a strided slice.
+    float ss = 0.0;
+    for (uint j = tid; j < H; j += 256u) {
+        float v = x[row_off + j];
+        ss = fma(v, v, ss);
+    }
+    partial[tid] = ss;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        barrier();
+    }
+
+    const float mean_sq = partial[0] / float(H);
+    const float scale   = inversesqrt(mean_sq + params.eps);
+
+    // Pass 2: y = x * scale * (1 + w)  — zero-centered contract.
+    for (uint j = tid; j < H; j += 256u) {
+        y[row_off + j] = x[row_off + j] * scale * (1.0 + w[j]);
+    }
+}

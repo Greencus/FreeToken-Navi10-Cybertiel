@@ -1,0 +1,147 @@
+#version 450
+// topk256_k8_f32.comp — GPU router tail (GPU-router task, oracle-3 R3).
+//
+// Replaces the host softmax -> torch.topk -> renormalize -> canonical
+// sort -> per-expert scale fold sequence for a 256-expert / top-8 router.
+// One workgroup of 256 threads per token row; E=256, K=8 hardcoded to the
+// model geometry (a NEW kernel on purpose — the E=128/MAX_K=8 moe_router
+// and the E=128/K=4 topk_softmax_128 shaders do NOT fit 256x8).
+//
+// Pipeline (matches host math in _record_moe_in / _moe_step):
+//   1. probs = softmax(logits)                       (max-shift, tree reduce)
+//   2. top-K via K linear scans, FIRST-MAX-WINS tie order (lowest expert
+//      id on exact ties). Only tid==0 touches chosen_idx/val; probs[]
+//      masks are also tid==0-only single-writer writes between barriers —
+//      the same provably-safe shared pattern as moe_router / gdn v3
+//      (no simultaneous multi-writer arrays).
+//   3. renormalize: values /= values.sum()
+//   4. canonical sort of the K (expert_id, value) pairs by EXPERT ID
+//      ascending (host: sorted(zip(elist, vlist))).
+//   5. arena write: per canonical slot j write the per-expert weight
+//      scales folded with the router value:
+//        arena_gs[j]      = fgs[expert_j]      (fused gateup global scale)
+//        arena_gs[K + j]  = dgs[expert_j] * v_j (down scale x router value)
+//      and the arena SLOT index for each expert (map lookup).
+//
+//   SENTINEL CONTRACT (oracle-8 fix 1): NO_SLOT is the SINGLE shared
+//   absent-expert sentinel (0x7FFFFFFF) — the host _gpu_router_sync_map
+//   fills the map buffer with this SAME constant, and this kernel maps it
+//   to the reserved no-content slot 0.  Slot 0 is NEVER a valid
+//   assignment (the host _arena_assign hands out slots 1..arena_n-1
+//   only), so a written 0 unambiguously means "expert has no arena
+//   content; the host must re-record" and can never be confused with a
+//   real slot.  A raw NO_SLOT value in the ids buffer is a bug (the host
+//   asserts on it).
+const uint  NO_SLOT = 0x7FFFFFFFu;
+//
+// Bindings:
+//   0 = logits    float[T, E]     (router GEMM output, resident)
+//   1 = expscale  float[E, 2]     (per-expert [fgs, dgs], resident, pinned)
+//   2 = map       uint [E]        (expert -> arena slot; NO_SLOT = none)
+//   3 = topk_ids  uint [T, K]     (EXPERT ids, canonical order, readback)
+//   4 = topk_vals float[T, K]     (renormalized router values, canonical)
+//   5 = arena_ids uint [T, K]     (slot indices, canonical; the _arena_ids
+//                                  buffer the fused MoE dispatches read)
+//   6 = arena_gs  float[T, 2K]  (folded scales; the _arena_gs buffer)
+// Push: { E, K, T } (12 B).  Dispatch: gx = T.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer LBuf { float logits[]; };
+layout(std430, binding = 1) readonly  buffer EBuf { float expscale[]; };
+layout(std430, binding = 2) readonly  buffer MBuf { uint   map[]; };
+layout(std430, binding = 3) writeonly buffer IBuf { uint   topk_ids[]; };
+layout(std430, binding = 4) writeonly buffer VBuf { float topk_vals[]; };
+layout(std430, binding = 5) writeonly buffer AIBuf { uint  arena_ids[]; };
+layout(std430, binding = 6) writeonly buffer AGBuf { float arena_gs[]; };
+
+layout(push_constant) uniform Params { uint E; uint K; uint T; } p;
+
+shared float probs[256];      // softmax probabilities, one slot per expert
+shared float sdata[256];      // reduction scratch
+shared uint  chosen_idx[8];   // top-K expert ids (descending value)
+shared float chosen_val[8];   // top-K values (pre-renorm)
+shared uint  srt_idx[8];      // canonical (expert-id ascending) order
+shared float srt_val[8];
+
+const float NEG_LARGE = -3.4e38;
+
+void main() {
+    const uint tok = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    if (tok >= p.T) return;
+
+    // ---- 1. load + softmax --------------------------------------------
+    probs[tid] = logits[tok * p.E + tid];
+    barrier();
+    sdata[tid] = probs[tid];
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        barrier();
+    }
+    const float pmax = sdata[0];
+    probs[tid] = exp(probs[tid] - pmax);
+    barrier();
+    sdata[tid] = probs[tid];
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    probs[tid] = probs[tid] * (1.0 / sdata[0]);
+    barrier();
+
+    // ---- 2. top-K (serial region, tid==0 only; first-max-wins) --------
+    if (tid == 0u) {
+        for (uint k = 0u; k < p.K; ++k) {
+            float best_v = NEG_LARGE;
+            uint  best_i = 0u;
+            for (uint e = 0u; e < p.E; ++e) {
+                if (probs[e] > best_v) { best_v = probs[e]; best_i = e; }
+            }
+            chosen_idx[k] = best_i;
+            chosen_val[k] = best_v;
+            probs[best_i] = NEG_LARGE;   // mask so next pass finds next-best
+        }
+
+        // ---- 3. renormalize the 8 chosen values (host: v / v.sum()) ----
+        float s = 0.0;
+        for (uint k = 0u; k < p.K; ++k) s += chosen_val[k];
+        const float inv_s = 1.0 / s;
+        for (uint k = 0u; k < p.K; ++k) chosen_val[k] = chosen_val[k] * inv_s;
+
+        // ---- 4. canonical sort by expert id (insertion sort, ascending)
+        for (uint k = 0u; k < p.K; ++k) { srt_idx[k] = chosen_idx[k]; srt_val[k] = chosen_val[k]; }
+        for (uint i = 1u; i < p.K; ++i) {
+            const uint id_i = srt_idx[i];
+            const float v_i = srt_val[i];
+            uint j = i;
+            while (j > 0u && srt_idx[j - 1u] > id_i) {
+                srt_idx[j] = srt_idx[j - 1u];
+                srt_val[j] = srt_val[j - 1u];
+                --j;
+            }
+            srt_idx[j] = id_i;
+            srt_val[j] = v_i;
+        }
+
+        // ---- 5. canonical outputs + arena scale fold -------------------
+        for (uint k = 0u; k < p.K; ++k) {
+            const uint  eid = srt_idx[k];
+            const float v   = srt_val[k];
+            topk_ids[tok * p.K + k] = eid;
+            topk_vals[tok * p.K + k] = v;
+            const uint slot = map[eid];
+            arena_ids[tok * p.K + k] = (slot == NO_SLOT) ? 0u : slot;
+            // arena_gs row stride is 2K (fgs at [0..K), dgs*v at [K..2K));
+            // the second-half offset is p.K, never a hardcoded 8u
+            // (oracle-10 I4).  K=8 here, so this is address-equivalent
+            // to the old 8u literal, but a K!=8 launch no longer writes
+            // the dgs into the next token's fgs half.
+            arena_gs[tok * (2u * p.K) + 0u + k] = \
+                expscale[eid * 2u + 0u];                              // fgs
+            arena_gs[tok * (2u * p.K) + p.K + k] = \
+                expscale[eid * 2u + 1u] * v;                          // dgs*v
+        }
+    }
+}

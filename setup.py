@@ -75,6 +75,12 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
 
 
 IS_ROCM = _is_rocm()
+# A Vulkan-only build (AMD GPUs, no CUDA) sets FREETOKEN_BUILD_VULKAN=1: it then
+# builds just the Vulkan extension and skips the CUDA/ROCm ones, which cannot
+# link without a CUDA or ROCm runtime.
+VULKAN_ONLY = (
+    os.environ.get("FREETOKEN_BUILD_VULKAN", "0") == "1" and not IS_ROCM and CUDA_HOME is None
+)
 
 if IS_ROCM:
     runtime_include_dirs, runtime_library_dirs, runtime_lib = _rocm_paths()
@@ -85,6 +91,12 @@ if IS_ROCM:
     extra_compile = ["-O3", "-std=c++20"]
     # Device sources (.cu, built by hipcc); BuildExtension adds the offload architectures.
     device_compile = ["-O3", "-std=c++20"]
+elif VULKAN_ONLY:
+    runtime_include_dirs, runtime_library_dirs = [], []
+    runtime_lib = ""
+    runtime_link_args = []
+    extra_compile = ["-O3", "-std=c++20"]
+    device_compile = []
 else:
     runtime_include_dirs, runtime_library_dirs = _cuda_runtime_paths()
     runtime_lib = "cudart"
@@ -96,7 +108,8 @@ else:
     device_compile = ["-O3", "-std=c++20"] + [f"-gencode=arch=compute_{a},code=sm_{a}" for a in (75, 80, 90, 100, 120)]
     device_compile.append("-gencode=arch=compute_75,code=compute_75")
 
-_check_toolchain()
+if not VULKAN_ONLY:
+    _check_toolchain()
 
 # ggml-cpu's row kernels for GGUF experts on the CPU MoE executor: one module per x86 variant of llama.cpp's GGML_CPU_ALL_VARIANTS (ggml/src/CMakeLists.txt), freetoken.kernel.ggml_cpu._<variant>.
 # freetoken.kernel.ggml_cpu.select() imports the best one this CPU runs; each module's entry is built without the variant's ISA flags so that check is safe on any CPU.
@@ -210,6 +223,31 @@ class BuildClib(build_clib):
             self.build_temp = build_temp
 
 
+def _vulkan_extensions() -> list[Extension]:
+    """The Vulkan compute backend, used on AMD GPUs (RDNA1/RDNA2).
+
+    Opt-in: set FREETOKEN_BUILD_VULKAN=1. It needs the Vulkan loader and headers
+    (vulkan-headers + the loader package); without them the extension is skipped
+    and the runtime falls back to a JIT build in freetoken.kernel.vulkan.
+    """
+    if os.environ.get("FREETOKEN_BUILD_VULKAN", "0") != "1":
+        return []
+    source = ROOT / "python" / "freetoken" / "kernel" / "vulkan" / "ext_module.cpp"
+    if not source.exists():
+        return []
+    if not Path("/usr/include/vulkan/vulkan.h").exists() and not os.environ.get("VULKAN_SDK"):
+        return []
+    return [
+        CppExtension(
+            name="freetoken.kernel.vulkan._ext",
+            sources=[str(source.relative_to(ROOT))],
+            include_dirs=[str(source.parent)],
+            libraries=["vulkan"],
+            extra_compile_args=["-std=c++20", "-O2"],
+        )
+    ]
+
+
 class BuildExt(BuildExtension):
     def run(self):
         # build_ext alone (`setup.py build_ext --inplace`) does not run build_clib
@@ -245,41 +283,43 @@ class BuildExt(BuildExtension):
 
 
 setup(
-    libraries=ggml_cpu_libraries,
+    libraries=[] if VULKAN_ONLY else ggml_cpu_libraries,
     ext_modules=[
-        CppExtension(
-            name="freetoken.kernel._pinned_tensor",
-            sources=[
-                "python/freetoken/kernel/csrc/pinned_tensor.cpp",
-            ],
-            include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs],
-            library_dirs=runtime_library_dirs,
-            libraries=[runtime_lib],
-            extra_compile_args=extra_compile,
-            extra_link_args=runtime_link_args,
-        ),
-        # CPU-compute MoE executor for --moe-backend cpu. Links cudart/amdhip64 for the
-        # cudaLaunchHostFunc submit/sync graph nodes; the bf16 GEMV microkernels
-        # use per-function target attributes (avx512bf16/avx512f) + a runtime
-        # __builtin_cpu_supports dispatch, so the single binary stays portable
-        # (scalar fallback) -- no global -march is set.
-        CppExtension(
-            name="freetoken.kernel._cpu_moe",
-            sources=[
-                "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
-                f"python/freetoken/kernel/csrc/cpu_moe/gpu_sync_{'hip' if IS_ROCM else 'cuda'}.cpp",
-                "python/freetoken/kernel/csrc/cpu_moe/gpu_sync_io.cu",
-                *sorted(
-                    str(p.relative_to(ROOT))
-                    for p in (ROOT / "python/freetoken/kernel/csrc/cpu_moe/kernels").glob("*.cpp")
-                ),
-            ],
-            include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs, str(ROOT / GGML_DIR / "freetoken")],
-            library_dirs=runtime_library_dirs,
-            libraries=[runtime_lib],
-            extra_compile_args={"cxx": extra_compile + ["-pthread"], "nvcc": device_compile},
-            extra_link_args=runtime_link_args,
-        ),
+        *([] if VULKAN_ONLY else [
+            CppExtension(
+                name="freetoken.kernel._pinned_tensor",
+                sources=[
+                    "python/freetoken/kernel/csrc/pinned_tensor.cpp",
+                ],
+                include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs],
+                library_dirs=runtime_library_dirs,
+                libraries=[runtime_lib],
+                extra_compile_args=extra_compile,
+                extra_link_args=runtime_link_args,
+            ),
+            # CPU-compute MoE executor for --moe-backend cpu. Links cudart/amdhip64 for the
+            # cudaLaunchHostFunc submit/sync graph nodes; the bf16 GEMV microkernels
+            # use per-function target attributes (avx512bf16/avx512f) + a runtime
+            # __builtin_cpu_supports dispatch, so the single binary stays portable
+            # (scalar fallback) -- no global -march is set.
+            CppExtension(
+                name="freetoken.kernel._cpu_moe",
+                sources=[
+                    "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
+                    f"python/freetoken/kernel/csrc/cpu_moe/gpu_sync_{'hip' if IS_ROCM else 'cuda'}.cpp",
+                    "python/freetoken/kernel/csrc/cpu_moe/gpu_sync_io.cu",
+                    *sorted(
+                        str(p.relative_to(ROOT))
+                        for p in (ROOT / "python/freetoken/kernel/csrc/cpu_moe/kernels").glob("*.cpp")
+                    ),
+                ],
+                include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs, str(ROOT / GGML_DIR / "freetoken")],
+                library_dirs=runtime_library_dirs,
+                libraries=[runtime_lib],
+                extra_compile_args={"cxx": extra_compile + ["-pthread"], "nvcc": device_compile},
+                extra_link_args=runtime_link_args,
+            ),
+        ]),
         # disk-backed row store (PLE / Engram tables); Linux-only until the TableFile/BatchReader seams grow Windows bodies
         *([
             CppExtension(
@@ -290,7 +330,8 @@ setup(
                 extra_compile_args=["-O3", "-std=c++20"],
             )
         ] if sys.platform == "linux" else []),
-        *ggml_cpu_modules,
+        *([] if VULKAN_ONLY else ggml_cpu_modules),
+        *_vulkan_extensions(),
     ],
     cmdclass={"build_clib": BuildClib, "build_ext": BuildExt.with_options(use_ninja=True)},
 )

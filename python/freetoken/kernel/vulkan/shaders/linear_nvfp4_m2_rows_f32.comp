@@ -1,0 +1,218 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_basic : require
+// M=1 v2 multi-output rows (researcher-8 task #21 groundwork, NOT wired).
+//
+// Down (2048x512): 1 WG -> 4 output rows, 64 lanes, shared X row-block
+//   across 4 accumulator chains (4x ILP, 3x fewer X loads vs m1).
+// Gate/up (1024x2048): 1 WG -> 2 rows with X sharing, same as m1 gateup.
+//   (4 g-chains + 4 u-chains, shuffle butterfly reduce.)
+//
+// kind (push constant, uniform):
+//   0 = plain down 4-row Y[r0..r0+3]=acc
+//   1 = gateup (reads stacked rows n and n+N, writes silu(gate)*up)
+//   2 = acc 4-row Y[r0..r0+3]+=acc (RMW)
+//
+// Numerics: each output row's dot product matches the resident path
+// bit-exactly: same decode (e2m1/e4m3 LUTs), same X elements (same
+// lane->word mapping as m1 when wpr_down=64), same FMA chain order
+// within each word.  The per-row accumulators are independent (no
+// cross-row shared state) so each is numerically identical to m1's
+// single-row accumulator.
+layout(local_size_x=64) in;
+layout(std430,binding=0) readonly buffer QBuf { uint packed32[]; };
+layout(std430,binding=1) readonly buffer SBuf { uint scales32[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) buffer YBuf { float Y[]; };
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint wpr; uint ng32; float gscale; uint kind; uint slot0;
+} p;
+shared float e2m1_lut[16];
+shared float e4m3_lut[256];
+
+// --- decode: bit-identical to m1 ---
+float e2m1_dec(uint v) {
+    uint s = v >> 3u, e = (v >> 1u) & 3u, m = v & 1u;
+    float a = (e == 0u)
+        ? (float(m) * 0.5)
+        : (exp2(float(e) - 1.0) * (1.0 + float(m) * 0.5));
+    return (s == 1u) ? -a : a;
+}
+
+float e4m3_dec(uint b) {
+    uint s = b >> 7u, e = (b >> 3u) & 15u, m = b & 7u;
+    if (e == 0u) {
+        float a = exp2(-6.0) * float(m) / 8.0;
+        return (s == 1u) ? -a : a;
+    }
+    if (e == 15u && m == 7u) return 0.0;
+    float a = exp2(float(e) - 7.0) * (1.0 + float(m) / 8.0);
+    return (s == 1u) ? -a : a;
+}
+
+// Word8 for a single row, accumulating into acc.  Exact copy of m1 word8.
+void word8(uint w, uint wbase, uint srow, uint kbase, float gs,
+           inout float acc) {
+    uint wd = packed32[wbase + w];
+    uint g = (w << 3u) >> 4u;
+    uint sw = scales32[srow + (g >> 2u)];
+    float s = e4m3_lut[(sw >> (8u * (g & 3u))) & 255u] * gs;
+    for (uint i = 0u; i < 4u; ++i) {
+        uint kpos = (w << 3u) + (i << 1u) + kbase;
+        uint elo = wd & 15u;  wd = wd >> 4u;
+        uint ehi = wd & 15u;  wd = wd >> 4u;
+        acc = fma(X[kpos],     s * e2m1_lut[elo], acc);
+        acc = fma(X[kpos+1u], s * e2m1_lut[ehi], acc);
+    }
+}
+
+void main() {
+    uint li = gl_LocalInvocationID.x;
+    // --- LUT init (same as m1: 64 lanes fill 16+256) ---
+    for (uint i = li; i < 16u; i += 64u) e2m1_lut[i] = e2m1_dec(i);
+    for (uint i = li; i < 256u; i += 64u) e4m3_lut[i] = e4m3_dec(i);
+    subgroupBarrier();
+
+    float gs = p.gscale;
+    uint t = gl_WorkGroupID.y;
+
+    // ==================================================================
+    // kind 1 — gateup (identical to m1 gateup: 2 rows, 4+4 chains)
+    // ==================================================================
+    if (p.kind == 1u) {
+        uint n = gl_WorkGroupID.x;
+        if (n >= p.N || t >= p.T) return;
+        uint kbase = t * p.K;
+        uint wbase_g = (p.slot0 + n) * p.wpr,         srow_g = (p.slot0 + n) * p.ng32;
+        uint wbase_u = (p.slot0 + n + p.N) * p.wpr, srow_u = (p.slot0 + n + p.N) * p.ng32;
+        float a0g = 0.0, a1g = 0.0, a2g = 0.0, a3g = 0.0;
+        float a0u = 0.0, a1u = 0.0, a2u = 0.0, a3u = 0.0;
+        uint w = li;
+        if (w < p.wpr) {
+            word8(w, wbase_g, srow_g, kbase, gs, a0g);
+            word8(w, wbase_u, srow_u, kbase, gs, a0u);
+        }
+        w = li + 64u;
+        if (w < p.wpr) {
+            word8(w, wbase_g, srow_g, kbase, gs, a1g);
+            word8(w, wbase_u, srow_u, kbase, gs, a1u);
+        }
+        w = li + 128u;
+        if (w < p.wpr) {
+            word8(w, wbase_g, srow_g, kbase, gs, a2g);
+            word8(w, wbase_u, srow_u, kbase, gs, a2u);
+        }
+        w = li + 192u;
+        if (w < p.wpr) {
+            word8(w, wbase_g, srow_g, kbase, gs, a3g);
+            word8(w, wbase_u, srow_u, kbase, gs, a3u);
+        }
+        float sg = (a0g + a1g) + (a2g + a3g);
+        float su = (a0u + a1u) + (a2u + a3u);
+        for (uint s = 32u; s > 0u; s >>= 1u) {
+            sg += subgroupShuffleXor(sg, s);
+            su += subgroupShuffleXor(su, s);
+        }
+        if (li == 0u) {
+            float v = sg;
+            float silu = v / (1.0 + exp(-v));
+            Y[t * p.N + n] = silu * su;
+        }
+        return;
+    }
+
+    // ==================================================================
+    // kind 0/2 — down 4-row: 1 WG computes rows [r0, r0+3]
+    // ==================================================================
+    uint r0 = gl_WorkGroupID.x * 4u;
+    if (r0 + 3u >= p.N || t >= p.T) return;
+    uint kbase = t * p.K;
+
+    // 4 independent accumulator chains, one per output row.
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+
+    // Each lane li in [0,63] owns word index li within each row.
+    // Load 4 packed words (one per row, same word index) and 4 scale
+    // values, then do 4 independent word8-like chains with shared X.
+    uint wbase0 = (p.slot0 + r0)       * p.wpr;
+    uint wbase1 = (p.slot0 + r0 + 1u)  * p.wpr;
+    uint wbase2 = (p.slot0 + r0 + 2u)  * p.wpr;
+    uint wbase3 = (p.slot0 + r0 + 3u)  * p.wpr;
+    uint srow0  = (p.slot0 + r0)       * p.ng32;
+    uint srow1  = (p.slot0 + r0 + 1u)  * p.ng32;
+    uint srow2  = (p.slot0 + r0 + 2u)  * p.ng32;
+    uint srow3  = (p.slot0 + r0 + 3u)  * p.ng32;
+
+    if (li < p.wpr) {
+        // Load scale groups for each row at this word.
+        uint g  = (li << 3u) >> 4u;  // scale group for word li
+        uint sw0 = scales32[srow0 + (g >> 2u)];
+        uint sw1 = scales32[srow1 + (g >> 2u)];
+        uint sw2 = scales32[srow2 + (g >> 2u)];
+        uint sw3 = scales32[srow3 + (g >> 2u)];
+        float s0 = e4m3_lut[(sw0 >> (8u * (g & 3u))) & 255u] * gs;
+        float s1 = e4m3_lut[(sw1 >> (8u * (g & 3u))) & 255u] * gs;
+        float s2 = e4m3_lut[(sw2 >> (8u * (g & 3u))) & 255u] * gs;
+        float s3 = e4m3_lut[(sw3 >> (8u * (g & 3u))) & 255u] * gs;
+
+        // Load packed words (one per row).
+        uint wd0 = packed32[wbase0 + li];
+        uint wd1 = packed32[wbase1 + li];
+        uint wd2 = packed32[wbase2 + li];
+        uint wd3 = packed32[wbase3 + li];
+
+        // Unroll 4 words x 8 elements.  X values loaded once and shared.
+        for (uint i = 0u; i < 4u; ++i) {
+            uint kpos = (li << 3u) + (i << 1u) + kbase;
+            float x0 = X[kpos];
+            float x1 = X[kpos + 1u];
+            // Row 0
+            { uint elo = wd0 & 15u; wd0 >>= 4u;
+              uint ehi = wd0 & 15u; wd0 >>= 4u;
+              a0 = fma(x0, s0 * e2m1_lut[elo], a0);
+              a0 = fma(x1, s0 * e2m1_lut[ehi], a0); }
+            // Row 1
+            { uint elo = wd1 & 15u; wd1 >>= 4u;
+              uint ehi = wd1 & 15u; wd1 >>= 4u;
+              a1 = fma(x0, s1 * e2m1_lut[elo], a1);
+              a1 = fma(x1, s1 * e2m1_lut[ehi], a1); }
+            // Row 2
+            { uint elo = wd2 & 15u; wd2 >>= 4u;
+              uint ehi = wd2 & 15u; wd2 >>= 4u;
+              a2 = fma(x0, s2 * e2m1_lut[elo], a2);
+              a2 = fma(x1, s2 * e2m1_lut[ehi], a2); }
+            // Row 3
+            { uint elo = wd3 & 15u; wd3 >>= 4u;
+              uint ehi = wd3 & 15u; wd3 >>= 4u;
+              a3 = fma(x0, s3 * e2m1_lut[elo], a3);
+              a3 = fma(x1, s3 * e2m1_lut[ehi], a3); }
+        }
+    }
+
+    // Butterfly reduce each row's partial across 64 lanes.
+    // Each row's accumulator is lane-private; XOR shuffle operates
+    // on all 4 lanes simultaneously (subgroupShuffleXor lanes can
+    // operate on different lanes, each shuffle does one value).
+    // We must reduce a0, a1, a2, a3 separately.  Unroll.
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        a0 += subgroupShuffleXor(a0, s);
+        a1 += subgroupShuffleXor(a1, s);
+        a2 += subgroupShuffleXor(a2, s);
+        a3 += subgroupShuffleXor(a3, s);
+    }
+
+    if (li == 0u) {
+        uint ybase = t * p.N + r0;
+        if (p.kind == 2u) {
+            Y[ybase]     += a0;
+            Y[ybase + 1u] += a1;
+            Y[ybase + 2u] += a2;
+            Y[ybase + 3u] += a3;
+        } else {
+            Y[ybase]     = a0;
+            Y[ybase + 1u] = a1;
+            Y[ybase + 2u] = a2;
+            Y[ybase + 3u] = a3;
+        }
+    }
+}

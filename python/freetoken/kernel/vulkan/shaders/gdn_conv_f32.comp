@@ -1,0 +1,43 @@
+#version 450
+// gdn_conv_f32.comp — GDN conv1d tap + SiLU for Qwen3.5 linear attention.
+//
+// Per element i in [0, C): read qkv[i] and the 3-deep conv history
+// buf[i, 0..2], compute mixed = taps[i,0]*b0 + taps[i,1]*b1 +
+// taps[i,2]*b2 + taps[i,3]*qkv[i], shift the history
+// (buf[i,0..1] = old buf[i,1..2], buf[i,2] = qkv[i]), write
+// mixed[i] = silu(mixed).
+//
+// Matches ResidentNVFP4._gdn_host tap math EXACTLY (same op order per
+// element; elements are independent so no cross-thread ordering issue).
+// silu formula matches swiglu_f32.comp: g / (1 + exp(-g)).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufQkv   { float qkv[]; };
+layout(std430, binding = 1) buffer BufHist            { float buf[]; };  // [C,3] RW
+layout(std430, binding = 2) readonly  buffer BufTaps  { float taps[]; }; // [C,4]
+layout(std430, binding = 3) writeonly buffer BufMixed { float mixed[]; };
+
+layout(push_constant) uniform Params {
+    uint C;
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.C) return;
+    const float q = qkv[i];
+    const uint b3 = i * 3u;
+    const float b0 = buf[b3 + 0u];
+    const float b1 = buf[b3 + 1u];
+    const float b2 = buf[b3 + 2u];
+    const uint t4 = i * 4u;
+    // Same association order as torch: (t0*b0 + t1*b1 + t2*b2) + t3*q.
+    // GLSL evaluates left-to-right for +; fma formulation would differ
+    // in rounding, so keep plain muls+adds like the host.
+    const float m = taps[t4 + 0u] * b0 + taps[t4 + 1u] * b1
+                  + taps[t4 + 2u] * b2 + taps[t4 + 3u] * q;
+    buf[b3 + 0u] = b1;
+    buf[b3 + 1u] = b2;
+    buf[b3 + 2u] = q;
+    mixed[i] = m / (1.0 + exp(-m));
+}

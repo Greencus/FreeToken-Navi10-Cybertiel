@@ -1,0 +1,123 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_basic : require
+// M=1 NVFP4 matvec fast path (task #20): Wave64 single-wavefront WG.
+//
+// v2: latency-exposed single-wave WGs measured SLOWER than the 128-lane
+// resident (gateup 6.8 vs 6.4 us, acc 6.7 vs 4.6 us): with one 64-lane
+// wave per WG there is no second wave to overlap memory stalls, and the
+// v1 32-FMA serial accumulation chain doubled the resident's 16-FMA
+// dependency chain. v2 keeps the 64-lane geometry (shuffle butterfly,
+// no LDS partial[]/barriers) but restores:
+//   * the resident's STRIDED, fully-coalesced word mapping: lane li
+//     handles words li, li+64, li+128, li+192 (wpr=256; fewer for
+//     smaller rows) — every load instruction is contiguous across lanes.
+//   * FOUR independent accumulator chains per lane (one per owned word,
+//     8 serial FMA each) => 4x ILP; gateup gets 8 chains (g and u),
+//     hiding memory latency that the single wave can no longer overlap
+//     with a sibling wave.
+//   * e2m1/e4m3 decoded via LDS LUTs (bit-identical values; RDNA1 has
+//     no hardware exp2, direct decode measured a 12% regression).
+//   * butterfly reduce via subgroupShuffleXor (offsets 32,16,8,4,2,1),
+//     the closest mirror of the resident tree strides 64..1; reordered
+//     accumulation (chains + XOR pairing) is the parallelization-forced
+//     fp32 floor (~1e-6-ish, verified in isolation).
+//
+// kind (push constant, uniform): 0 = plain Y[t*N+n]=acc,
+// 1 = gateup (reads stacked rows n and n+N, writes silu(gate)*up),
+// 2 = acc (Y[t*N+n] += acc, RMW).
+layout(local_size_x=64) in;
+layout(std430,binding=0) readonly buffer QBuf { uint packed32[]; };
+layout(std430,binding=1) readonly buffer SBuf { uint scales32[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) buffer YBuf { float Y[]; };
+layout(push_constant) uniform P { uint T;uint N;uint K;uint wpr;uint ng32;float gscale;uint kind;uint slot0; } p;
+shared float e2m1_lut[16];
+shared float e4m3_lut[256];
+
+float e2m1_dec(uint v){
+uint s=v>>3u,e=(v>>1u)&3u,m=v&1u;
+float a=(e==0u)?(float(m)*0.5):(exp2(float(e)-1.0)*(1.0+float(m)*0.5));
+return (s==1u)?-a:a;
+}
+float e4m3_dec(uint b){
+uint s=b>>7u,e=(b>>3u)&15u,m=b&7u;
+if(e==0u){float a=exp2(-6.0)*float(m)/8.0;return (s==1u)?-a:a;}
+if(e==15u&&m==7u)return 0.0;
+float a=exp2(float(e)-7.0)*(1.0+float(m)/8.0);
+return (s==1u)?-a:a;
+}
+
+// One word (8 elems) into a dedicated accumulator chain.
+void word8(uint w,uint wbase,uint srow,uint kbase,float gs,
+           inout float acc){
+uint wd=packed32[wbase+w];
+uint g=(w<<3u)>>4u;            // scale group (16 elems)
+uint sw=scales32[srow+(g>>2u)];
+float s=e4m3_lut[(sw>>(8u*(g&3u)))&255u]*gs;
+for(uint i=0u;i<4u;++i){
+  uint kpos=(w<<3u)+(i<<1u)+kbase;
+  uint elo=wd&15u; wd=wd>>4u;
+  uint ehi=wd&15u; wd=wd>>4u;
+  acc=fma(X[kpos],s*e2m1_lut[elo],acc);
+  acc=fma(X[kpos+1u],s*e2m1_lut[ehi],acc);
+}
+}
+
+void main(){
+uint li=gl_LocalInvocationID.x;
+uint n=gl_WorkGroupID.x,t=gl_WorkGroupID.y;
+if(n>=p.N||t>=p.T)return;
+for(uint i=li;i<16u;i+=64u)e2m1_lut[i]=e2m1_dec(i);
+for(uint i=li;i<256u;i+=64u)e4m3_lut[i]=e4m3_dec(i);
+subgroupBarrier();
+float gs=p.gscale;
+uint kbase=t*p.K;
+uint knd=p.kind;
+
+if(knd==1u){
+  // gateup: stacked rows n (gate) and n+N (up); FOUR g and u chains.
+  uint wbase_g=(p.slot0+n)*p.wpr,       srow_g=(p.slot0+n)*p.ng32;
+  uint wbase_u=(p.slot0+n+p.N)*p.wpr, srow_u=(p.slot0+n+p.N)*p.ng32;
+  float a0g=0.0,a1g=0.0,a2g=0.0,a3g=0.0;
+  float a0u=0.0,a1u=0.0,a2u=0.0,a3u=0.0;
+  uint w=li;
+  if(w<p.wpr){word8(w,wbase_g,srow_g,kbase,gs,a0g);word8(w,wbase_u,srow_u,kbase,gs,a0u);}
+  w=li+64u;
+  if(w<p.wpr){word8(w,wbase_g,srow_g,kbase,gs,a1g);word8(w,wbase_u,srow_u,kbase,gs,a1u);}
+  w=li+128u;
+  if(w<p.wpr){word8(w,wbase_g,srow_g,kbase,gs,a2g);word8(w,wbase_u,srow_u,kbase,gs,a2u);}
+  w=li+192u;
+  if(w<p.wpr){word8(w,wbase_g,srow_g,kbase,gs,a3g);word8(w,wbase_u,srow_u,kbase,gs,a3u);}
+  float sg=(a0g+a1g)+(a2g+a3g);
+  float su=(a0u+a1u)+(a2u+a3u);
+  for(uint s=32u;s>0u;s>>=1u){
+    sg+=subgroupShuffleXor(sg,s);
+    su+=subgroupShuffleXor(su,s);
+  }
+  if(li==0u){
+    float v=sg;
+    float silu=v/(1.0+exp(-v));
+    Y[t*p.N+n]=silu*su;
+  }
+  return;
+}
+
+// plain / acc: four single-accumulator chains, then butterfly.
+uint wbase=(p.slot0+n)*p.wpr, srow=(p.slot0+n)*p.ng32;
+float a0=0.0,a1=0.0,a2=0.0,a3=0.0;
+uint w=li;
+if(w<p.wpr)word8(w,wbase,srow,kbase,gs,a0);
+w=li+64u;
+if(w<p.wpr)word8(w,wbase,srow,kbase,gs,a1);
+w=li+128u;
+if(w<p.wpr)word8(w,wbase,srow,kbase,gs,a2);
+w=li+192u;
+if(w<p.wpr)word8(w,wbase,srow,kbase,gs,a3);
+float acc=(a0+a1)+(a2+a3);
+for(uint s=32u;s>0u;s>>=1u)acc+=subgroupShuffleXor(acc,s);
+if(li==0u){
+  if(knd==2u)Y[t*p.N+n]+=acc;
+  else Y[t*p.N+n]=acc;
+}
+}

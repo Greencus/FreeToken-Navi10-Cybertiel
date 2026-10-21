@@ -1,0 +1,257 @@
+#version 450
+// Fused 8-expert down accumulate (MUL_MAT_ID-style, arena).
+// ONE dispatch replaces the 8 per-expert acc dispatches of a layer.
+// Grid = (N down rows, 1): each 128-lane workgroup computes ALL 8
+// routed experts' down dots for ONE output row and accumulates them into
+// h_y_acc row n in canonical expert order j = 0..7.
+//
+// Why ONE workgroup per row instead of grid (N, 8)?  The old path ran 8
+// sequential dispatches, so row n received 8 fp32 RMW adds in strict
+// dispatch order ((0 + d0) + d1 ... + d7).  With one WG per (j, n) the
+// 8 WGs sharing a row would race and the add order would be
+// nondeterministic (breaks bat-vs-bat2 == 0.0).  Here each lane keeps 8
+// private accumulators (one per expert), a single 8-array tree reduce
+// yields d_j for all j, lane 0 sums them in j order into a register and
+// applies ONE add: Y[n] = 0 + ((d0 + d1) + ... + d7), bit-identical to
+// the sequential chain (h_y_acc is pre-filled with exact +0.0, so the
+// exact-zero first add is free).  Each d_j is the SAME tree/chain as the
+// per-expert kernel's partial[0] (same lane->word split, same scale
+// indexing, same FMA order, same butterfly), so every dot is bit-equal
+// to the 8-dispatch path.  Only the X base address moves per expert:
+// X[kpos] -> silu_all[j*silu_N + kpos], matching where the fused
+// gateup8 kernel wrote expert j's silu(gate)*up.
+//
+// Bindings:
+//   0 = arena packed bytes  (down wd, slot stride = rows_per_slot rows)
+//   1 = arena scales u32    (sd, slots stacked the same way)
+//   2 = X                   (h_silu_all fp32, expert j at [j*silu_N ..))
+//   3 = Y                   (h_y_acc fp32, accumulated [N] rows)
+//   4 = Ids u32[8]          (expert j -> slot index)
+//   5 = Gs   float[16]      (acc fp32 global scale at Gs[8 + j])
+// Push: {T, N, K, wpr, ng32, rows_per_slot, silu_N} (28 B).
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer QBuf { uint packed32[]; };
+layout(std430,binding=1) readonly buffer SBuf { uint scales32[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) buffer YBuf { float Y[]; };
+layout(std430,binding=4) readonly buffer IBuf { uint Ids[]; };
+layout(std430,binding=5) readonly buffer GBuf { float Gs[]; };
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint wpr; uint ng32;
+    uint rows_per_slot; uint silu_N;
+} p;
+shared float e2m1_lut[16];
+shared float e4m3_lut[256];
+shared float partial[8][128];
+float e2m1_dec(uint v){
+uint s=v>>3u,e=(v>>1u)&3u,m=v&1u;
+float a=(e==0u)?(float(m)*0.5):(exp2(float(e)-1.0)*(1.0+float(m)*0.5));
+return (s==1u)?-a:a;
+}
+float e4m3_dec(uint b){
+uint s=b>>7u,e=(b>>3u)&15u,m=b&7u;
+if(e==0u){float a=exp2(-6.0)*float(m)/8.0;return (s==1u)?-a:a;}
+if(e==15u&&m==7u)return 0.0;
+float a=exp2(float(e)-7.0)*(1.0+float(m)/8.0);
+return (s==1u)?-a:a;
+}
+void main(){
+uint li=gl_LocalInvocationID.x;
+for(uint i=li;i<16u;i+=128u)e2m1_lut[i]=e2m1_dec(i);
+for(uint i=li;i<256u;i+=128u)e4m3_lut[i]=e4m3_dec(i);
+barrier();
+uint n=gl_WorkGroupID.x;
+if(n>=p.N)return;
+// Per-expert private accumulators: expert j's dot for row n, all 8 in
+// one lane so the final adds can be serialized deterministically.
+float v0=0.0,v1=0.0,v2=0.0,v3=0.0;
+float v4=0.0,v5=0.0,v6=0.0,v7=0.0;
+for(uint w=li;w<p.wpr;w+=128u){
+uint g=(w<<3u)>>4u;                 // scale group index for this word
+uint kpos=(w<<3u);                  // base X pointer for this word (t=0)
+// --- expert 0 ---
+{
+uint slot=Ids[0u];
+uint slot0=slot*p.rows_per_slot;
+uint wd=packed32[(slot0+n)*p.wpr+w];
+uint sw=scales32[(slot0+n)*p.ng32+(g>>2u)];
+float s=e4m3_lut[(sw>>(8u*(g&3u)))&255u]*Gs[8u+0u];
+uint xb=0u*p.silu_N+kpos;
+uint elo=wd&15u; wd=wd>>4u;
+uint ehi=wd&15u; wd=wd>>4u;
+v0=fma(X[xb],s*e2m1_lut[elo],v0);
+v0=fma(X[xb+1u],s*e2m1_lut[ehi],v0);
+for(uint i=1u;i<4u;++i){
+uint kp=xb+(i<<1u);
+elo=wd&15u; wd=wd>>4u;
+ehi=wd&15u; wd=wd>>4u;
+v0=fma(X[kp],s*e2m1_lut[elo],v0);
+v0=fma(X[kp+1u],s*e2m1_lut[ehi],v0);
+}
+}
+// --- expert 1 ---
+{
+uint slot=Ids[1u];
+uint slot0=slot*p.rows_per_slot;
+uint wd=packed32[(slot0+n)*p.wpr+w];
+uint sw=scales32[(slot0+n)*p.ng32+(g>>2u)];
+float s=e4m3_lut[(sw>>(8u*(g&3u)))&255u]*Gs[8u+1u];
+uint xb=1u*p.silu_N+kpos;
+uint elo=wd&15u; wd=wd>>4u;
+uint ehi=wd&15u; wd=wd>>4u;
+v1=fma(X[xb],s*e2m1_lut[elo],v1);
+v1=fma(X[xb+1u],s*e2m1_lut[ehi],v1);
+for(uint i=1u;i<4u;++i){
+uint kp=xb+(i<<1u);
+elo=wd&15u; wd=wd>>4u;
+ehi=wd&15u; wd=wd>>4u;
+v1=fma(X[kp],s*e2m1_lut[elo],v1);
+v1=fma(X[kp+1u],s*e2m1_lut[ehi],v1);
+}
+}
+// --- expert 2 ---
+{
+uint slot=Ids[2u];
+uint slot0=slot*p.rows_per_slot;
+uint wd=packed32[(slot0+n)*p.wpr+w];
+uint sw=scales32[(slot0+n)*p.ng32+(g>>2u)];
+float s=e4m3_lut[(sw>>(8u*(g&3u)))&255u]*Gs[8u+2u];
+uint xb=2u*p.silu_N+kpos;
+uint elo=wd&15u; wd=wd>>4u;
+uint ehi=wd&15u; wd=wd>>4u;
+v2=fma(X[xb],s*e2m1_lut[elo],v2);
+v2=fma(X[xb+1u],s*e2m1_lut[ehi],v2);
+for(uint i=1u;i<4u;++i){
+uint kp=xb+(i<<1u);
+elo=wd&15u; wd=wd>>4u;
+ehi=wd&15u; wd=wd>>4u;
+v2=fma(X[kp],s*e2m1_lut[elo],v2);
+v2=fma(X[kp+1u],s*e2m1_lut[ehi],v2);
+}
+}
+// --- expert 3 ---
+{
+uint slot=Ids[3u];
+uint slot0=slot*p.rows_per_slot;
+uint wd=packed32[(slot0+n)*p.wpr+w];
+uint sw=scales32[(slot0+n)*p.ng32+(g>>2u)];
+float s=e4m3_lut[(sw>>(8u*(g&3u)))&255u]*Gs[8u+3u];
+uint xb=3u*p.silu_N+kpos;
+uint elo=wd&15u; wd=wd>>4u;
+uint ehi=wd&15u; wd=wd>>4u;
+v3=fma(X[xb],s*e2m1_lut[elo],v3);
+v3=fma(X[xb+1u],s*e2m1_lut[ehi],v3);
+for(uint i=1u;i<4u;++i){
+uint kp=xb+(i<<1u);
+elo=wd&15u; wd=wd>>4u;
+ehi=wd&15u; wd=wd>>4u;
+v3=fma(X[kp],s*e2m1_lut[elo],v3);
+v3=fma(X[kp+1u],s*e2m1_lut[ehi],v3);
+}
+}
+// --- expert 4 ---
+{
+uint slot=Ids[4u];
+uint slot0=slot*p.rows_per_slot;
+uint wd=packed32[(slot0+n)*p.wpr+w];
+uint sw=scales32[(slot0+n)*p.ng32+(g>>2u)];
+float s=e4m3_lut[(sw>>(8u*(g&3u)))&255u]*Gs[8u+4u];
+uint xb=4u*p.silu_N+kpos;
+uint elo=wd&15u; wd=wd>>4u;
+uint ehi=wd&15u; wd=wd>>4u;
+v4=fma(X[xb],s*e2m1_lut[elo],v4);
+v4=fma(X[xb+1u],s*e2m1_lut[ehi],v4);
+for(uint i=1u;i<4u;++i){
+uint kp=xb+(i<<1u);
+elo=wd&15u; wd=wd>>4u;
+ehi=wd&15u; wd=wd>>4u;
+v4=fma(X[kp],s*e2m1_lut[elo],v4);
+v4=fma(X[kp+1u],s*e2m1_lut[ehi],v4);
+}
+}
+// --- expert 5 ---
+{
+uint slot=Ids[5u];
+uint slot0=slot*p.rows_per_slot;
+uint wd=packed32[(slot0+n)*p.wpr+w];
+uint sw=scales32[(slot0+n)*p.ng32+(g>>2u)];
+float s=e4m3_lut[(sw>>(8u*(g&3u)))&255u]*Gs[8u+5u];
+uint xb=5u*p.silu_N+kpos;
+uint elo=wd&15u; wd=wd>>4u;
+uint ehi=wd&15u; wd=wd>>4u;
+v5=fma(X[xb],s*e2m1_lut[elo],v5);
+v5=fma(X[xb+1u],s*e2m1_lut[ehi],v5);
+for(uint i=1u;i<4u;++i){
+uint kp=xb+(i<<1u);
+elo=wd&15u; wd=wd>>4u;
+ehi=wd&15u; wd=wd>>4u;
+v5=fma(X[kp],s*e2m1_lut[elo],v5);
+v5=fma(X[kp+1u],s*e2m1_lut[ehi],v5);
+}
+}
+// --- expert 6 ---
+{
+uint slot=Ids[6u];
+uint slot0=slot*p.rows_per_slot;
+uint wd=packed32[(slot0+n)*p.wpr+w];
+uint sw=scales32[(slot0+n)*p.ng32+(g>>2u)];
+float s=e4m3_lut[(sw>>(8u*(g&3u)))&255u]*Gs[8u+6u];
+uint xb=6u*p.silu_N+kpos;
+uint elo=wd&15u; wd=wd>>4u;
+uint ehi=wd&15u; wd=wd>>4u;
+v6=fma(X[xb],s*e2m1_lut[elo],v6);
+v6=fma(X[xb+1u],s*e2m1_lut[ehi],v6);
+for(uint i=1u;i<4u;++i){
+uint kp=xb+(i<<1u);
+elo=wd&15u; wd=wd>>4u;
+ehi=wd&15u; wd=wd>>4u;
+v6=fma(X[kp],s*e2m1_lut[elo],v6);
+v6=fma(X[kp+1u],s*e2m1_lut[ehi],v6);
+}
+}
+// --- expert 7 ---
+{
+uint slot=Ids[7u];
+uint slot0=slot*p.rows_per_slot;
+uint wd=packed32[(slot0+n)*p.wpr+w];
+uint sw=scales32[(slot0+n)*p.ng32+(g>>2u)];
+float s=e4m3_lut[(sw>>(8u*(g&3u)))&255u]*Gs[8u+7u];
+uint xb=7u*p.silu_N+kpos;
+uint elo=wd&15u; wd=wd>>4u;
+uint ehi=wd&15u; wd=wd>>4u;
+v7=fma(X[xb],s*e2m1_lut[elo],v7);
+v7=fma(X[xb+1u],s*e2m1_lut[ehi],v7);
+for(uint i=1u;i<4u;++i){
+uint kp=xb+(i<<1u);
+elo=wd&15u; wd=wd>>4u;
+ehi=wd&15u; wd=wd>>4u;
+v7=fma(X[kp],s*e2m1_lut[elo],v7);
+v7=fma(X[kp+1u],s*e2m1_lut[ehi],v7);
+}
+}
+}
+partial[0][li]=v0;
+partial[1][li]=v1;
+partial[2][li]=v2;
+partial[3][li]=v3;
+partial[4][li]=v4;
+partial[5][li]=v5;
+partial[6][li]=v6;
+partial[7][li]=v7;
+barrier();
+// Single butterfly reduce across all 8 arrays (same stride tree as the
+// per-expert kernel: partial[li] += partial[li+stride]).
+for(uint stride=64u;stride>0u;stride>>=1u){
+if(li<stride){
+for(uint j=0u;j<8u;j++)partial[j][li]+=partial[j][li+stride];
+}
+barrier();
+}
+if(li==0u){
+// Sequential fp32 adds in canonical expert order: bit-identical to
+// the old 8 sequential acc dispatches given the exact +0.0 fill.
+float r=0.0;
+for(uint j=0u;j<8u;j++)r+=partial[j][0];
+Y[n]+=r;
+}
+}

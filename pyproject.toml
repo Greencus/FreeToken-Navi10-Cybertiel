@@ -72,6 +72,7 @@ Issues = "https://github.com/FlashML-org/FreeToken/issues"
 
 [project.scripts]
 ft = "freetoken.cli:main"
+ft-vulkan = "freetoken.models.qwen3_5_moe.vulkan.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=6.0"]
@@ -112,7 +113,7 @@ version = {attr = "freetoken.version.__version__"}
 where = ["python"]
 
 [tool.setuptools.package-data]
-"*" = ["csrc/**/*", "moe/configs/**/*.json", "third_party/*/LICENSE", "third_party/*/VERSION", "third_party/*/freetoken.patch"]
+"*" = ["csrc/**/*", "moe/configs/**/*.json", "third_party/*/LICENSE", "third_party/*/VERSION", "third_party/*/freetoken.patch", "shaders/*.comp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

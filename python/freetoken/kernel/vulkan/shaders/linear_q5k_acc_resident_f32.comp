@@ -1,0 +1,96 @@
+#version 450
+// ggml Q5_K resident matvec, ACCUMULATE variant: lane 0 does
+// Y[t*N+n] += partial[0] so sequential expert down calls sum into one
+// resident buffer (cleared once per layer with batch_fill).
+// Unpack math is identical to linear_q5k_resident_f32.comp (see there);
+// the host uploads the GGUF bytes verbatim - no host dequant, no BF16 copy.
+//
+// block_q5_K (K a multiple of 256), 176 bytes per 256 weights:
+//   +0    half d      super-block scale
+//   +2    half dmin   super-block min
+//   +4    u8[12]      8 scales + 8 mins, 6-bit packed (get_scale_min_k4)
+//   +16   u8[32]      the 5th bit of every quant: for local weight k the
+//                      bit is bit k/32 of byte k%32 (llama.cpp
+//                      dequantize_row_q5_K indexes qh[l] with a shifting
+//                      mask, which is exactly this bit matrix)
+//   +48   u8[128]     256 x 4-bit low quants, same nibble pairing as Q4_K
+// dequant (mirrors dequantize_row_q5_K / models/gguf/dequant.py):
+//   q = low_nibble + (high_bit << 4)
+//   w = (d * sc[k/32]) * q - (dmin * m[k/32])
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer QBuf { uint Q[]; };
+layout(std430,binding=1) readonly buffer XBuf { float X[]; };
+layout(std430,binding=2) buffer YBuf { float Y[]; };
+// wpr = packed qs words per row (K/8); ng32 = words per super-block (44);
+// rowstride = words per packed row (block count * ng32).
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint wpr; uint ng32;
+    float gscale;
+    uint slot0; uint rowstride;
+} p;
+shared float partial[128];
+
+uint byte3(uint i, uint w0, uint w1, uint w2) {
+    return i < 4u ? ((w0 >> (8u * (i & 3u))) & 255u)
+         : i < 8u ? ((w1 >> (8u * (i & 3u))) & 255u)
+                  : ((w2 >> (8u * (i & 3u))) & 255u);
+}
+
+void k4_sm(uint j, uint w0, uint w1, uint w2, out uint sc, out uint m) {
+    uint qj = byte3(j, w0, w1, w2);
+    uint qp = byte3(j + 4u, w0, w1, w2);
+    if (j < 4u) {
+        sc = qj & 63u;
+        m = qp & 63u;
+    } else {
+        uint qm = byte3(j - 4u, w0, w1, w2);
+        sc = (qp & 15u) | ((qm >> 6u) << 4u);
+        m = (qp >> 4u) | ((qj >> 6u) << 4u);
+    }
+}
+
+float row_dot(uint row, uint kbase, float gs) {
+    uint li = gl_LocalInvocationID.x;
+    uint wbase = row * p.rowstride;
+    float acc = 0.0;
+    for (uint w = li; w < p.wpr; w += 128u) {
+        uint sb = w >> 5u;
+        uint inb = w & 31u;
+        uint sbase = wbase + sb * p.ng32;
+        vec2 dm = unpackHalf2x16(Q[sbase]);
+        uint w0 = Q[sbase + 1u], w1 = Q[sbase + 2u], w2 = Q[sbase + 3u];
+        uint it = inb >> 3u;
+        uint sc0, m0, sc1, m1;
+        k4_sm(it << 1u, w0, w1, w2, sc0, m0);
+        k4_sm((it << 1u) + 1u, w0, w1, w2, sc1, m1);
+        float d1 = dm.x * float(sc0) * gs, f1 = dm.y * float(m0) * gs;
+        float d2 = dm.x * float(sc1) * gs, f2 = dm.y * float(m1) * gs;
+        uint klo = kbase + sb * 256u + it * 64u + (inb & 7u) * 4u;
+        uint khi = klo + 32u;
+        // qh dword covering local weights bytepos..bytepos+3 of this step;
+        // byte i of it holds bit it*2 (low nibble) and it*2+1 (high).
+        uint qhw = Q[sbase + 4u + (inb & 7u)];
+        uint wd = Q[sbase + p.ng32 - 32u + inb];
+        for (uint i = 0u; i < 4u; ++i) {
+            uint hb = (qhw >> (8u * i)) & 255u;
+            uint ql = (wd & 15u) | (((hb >> (it << 1u)) & 1u) << 4u); wd >>= 4u;
+            uint qh = (wd & 15u) | (((hb >> ((it << 1u) + 1u)) & 1u) << 4u); wd >>= 4u;
+            acc = fma(X[klo + i], fma(d1, float(ql), -f1), acc);
+            acc = fma(X[khi + i], fma(d2, float(qh), -f2), acc);
+        }
+    }
+    return acc;
+}
+
+void main() {
+    uint n = gl_WorkGroupID.x, t = gl_WorkGroupID.y;
+    if (n >= p.N || t >= p.T) return;
+    uint li = gl_LocalInvocationID.x;
+    partial[li] = row_dot(p.slot0 + n, t * p.K, p.gscale);
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (li < s) partial[li] += partial[li + s];
+        barrier();
+    }
+    if (li == 0u) Y[t * p.N + n] += partial[0];
+}

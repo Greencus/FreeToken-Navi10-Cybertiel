@@ -1,0 +1,72 @@
+#version 450
+// ggml Q8_0 resident matvec: Y[T,N] = X[T,K] @ W[N,K]^T with W stored as
+// packed block_q8_0 rows and UNPACKED INSIDE THE SHADER. Host uploads the
+// GGUF bytes verbatim (1.0625 B/weight instead of 2 for BF16).
+//
+// block_q8_0 (K a multiple of 64), 34 bytes per 32 weights:
+//   +0    half d      block scale
+//   +2    i8[32]      the 32 signed quants
+// dequant (mirrors dequantize_row_q8_0): w = d * q.
+//
+// Unlike the K-quants, a Q8_0 block is 34 bytes, so nothing but the whole
+// row is 4-byte aligned. The lane loop therefore runs over quarter-block
+// chunks (8 weights = 8 bytes each; wpr = K/8, ng32 = 4) and every
+// unaligned 32-bit window is rebuilt with dword_at(). Note this reads at
+// most one word past a row: keep >= 4 bytes of slack after the packed data
+// in the resident buffer (the K-quant shaders need none).
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer QBuf { uint Q[]; };
+layout(std430,binding=1) readonly buffer XBuf { float X[]; };
+layout(std430,binding=2) writeonly buffer YBuf { float Y[]; };
+// wpr = quarter-block chunks per row (K/8); ng32 = chunks per block (4);
+// rowstride = words per packed row (K/64 * 17, i.e. row bytes / 4).
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint wpr; uint ng32;
+    float gscale;
+    uint slot0; uint rowstride;
+} p;
+shared float partial[128];
+
+// 32-bit window at an arbitrary byte offset (aligned dword loads only).
+uint dword_at(uint a) {
+    uint ai = a >> 2;
+    uint sh = 8u * (a & 3u);
+    uint lo = Q[ai];
+    return sh == 0u ? lo : ((lo >> sh) | (Q[ai + 1u] << (32u - sh)));
+}
+
+float row_dot(uint row, uint kbase, float gs) {
+    uint li = gl_LocalInvocationID.x;
+    uint wbase = row * p.rowstride * 4u;   // byte offset of this packed row
+    float acc = 0.0;
+    for (uint w = li; w < p.wpr; w += 128u) {
+        uint blk = w >> 2u;
+        uint qtr = w & 3u;
+        uint bbase = wbase + blk * 34u;
+        float d = unpackHalf2x16(dword_at(bbase)).x * gs;
+        uint a = bbase + 2u + qtr * 8u;
+        uint k0 = kbase + blk * 32u + qtr * 8u;
+        for (uint j = 0u; j < 2u; ++j) {
+            uint bits = dword_at(a + j * 4u);
+            for (uint i = 0u; i < 4u; ++i) {
+                uint u = (bits >> (8u * i)) & 255u;
+                int qi = int(u ^ 0x80u) - 128;   // u8 -> int8, branchless
+                acc = fma(X[k0 + j * 4u + i], d * float(qi), acc);
+            }
+        }
+    }
+    return acc;
+}
+
+void main() {
+    uint n = gl_WorkGroupID.x, t = gl_WorkGroupID.y;
+    if (n >= p.N || t >= p.T) return;
+    uint li = gl_LocalInvocationID.x;
+    partial[li] = row_dot(p.slot0 + n, t * p.K, p.gscale);
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (li < s) partial[li] += partial[li + s];
+        barrier();
+    }
+    if (li == 0u) Y[t * p.N + n] = partial[0];
+}

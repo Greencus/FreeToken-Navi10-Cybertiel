@@ -1,0 +1,104 @@
+#version 450
+// ggml Q4_K resident matvec, ACCUMULATE variant: same as
+// linear_q4k_resident_f32.comp but lane 0 does Y[t*N+n] += partial[0], so
+// sequential expert down calls sum into one resident buffer (cleared once
+// per layer with batch_fill / vkCmdFillBuffer). Unpack math is identical
+// to linear_q4k_resident_f32.comp (see there); the host uploads the GGUF
+// bytes verbatim - no host dequant, no BF16 copy.
+//
+// block_q4_K (K a multiple of 256), 144 bytes per 256 weights:
+//   +0    half d      super-block scale
+//   +2    half dmin   super-block min
+//   +4    u8[12]      8 scales + 8 mins, 6-bit packed (get_scale_min_k4)
+//   +16   u8[128]     256 x 4-bit quants: within one 64-weight step the
+//                      LOW nibbles of 32 bytes give weights 0..31 and the
+//                      HIGH nibbles give weights 32..63 (llama.cpp
+//                      dequantize_row_q4_K), then q advances 32 bytes.
+// dequant (mirrors dequantize_row_q4_K / models/gguf/dequant.py):
+//   w = (d * sc[k/32]) * q - (dmin * m[k/32])     (k local to the block)
+//
+// Structure follows linear_nvfp4_resident_f32.comp so the batch engine can
+// drive it the same way: ONE workgroup per output row (grid = (N, T)),
+// 128 lanes split the row's packed 32-bit words (w = li, li+128, ...),
+// each word unpacks 4 low-nibble + 4 high-nibble weights, lane partials
+// tree-reduce through single-writer shared memory (RADV/Navi10 has produced
+// all-NaN outputs for multi-writer patterns), lane 0 accumulates Y[t*N+n].
+// fp32 accumulation throughout.
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer QBuf { uint Q[]; };
+layout(std430,binding=1) readonly buffer XBuf { float X[]; };
+layout(std430,binding=2) buffer YBuf { float Y[]; };
+// wpr      : packed qs words per row (K/8) - the lane loop trip count
+// ng32     : words per super-block, header included (36 here)
+// rowstride: words per packed row (block count * ng32)
+// slot0    : first row of this matrix inside a packed resident arena
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint wpr; uint ng32;
+    float gscale;
+    uint slot0; uint rowstride;
+} p;
+shared float partial[128];
+
+uint byte3(uint i, uint w0, uint w1, uint w2) {
+    return i < 4u ? ((w0 >> (8u * (i & 3u))) & 255u)
+         : i < 8u ? ((w1 >> (8u * (i & 3u))) & 255u)
+                  : ((w2 >> (8u * (i & 3u))) & 255u);
+}
+
+// ggml get_scale_min_k4(j): 6-bit scale + 6-bit min of group j (32 weights).
+void k4_sm(uint j, uint w0, uint w1, uint w2, out uint sc, out uint m) {
+    uint qj = byte3(j, w0, w1, w2);
+    uint qp = byte3(j + 4u, w0, w1, w2);
+    if (j < 4u) {
+        sc = qj & 63u;
+        m = qp & 63u;
+    } else {
+        uint qm = byte3(j - 4u, w0, w1, w2);
+        sc = (qp & 15u) | ((qm >> 6u) << 4u);
+        m = (qp >> 4u) | ((qj >> 6u) << 4u);
+    }
+}
+
+// Per-lane dot of X[t,*] with packed row `row`; the caller reduces.
+float row_dot(uint row, uint kbase, float gs) {
+    uint li = gl_LocalInvocationID.x;
+    uint wbase = row * p.rowstride;
+    float acc = 0.0;
+    for (uint w = li; w < p.wpr; w += 128u) {
+        uint sb = w >> 5u;              // super-block within the row
+        uint inb = w & 31u;             // qs word within the super-block
+        uint sbase = wbase + sb * p.ng32;
+        vec2 dm = unpackHalf2x16(Q[sbase]);   // x = d, y = dmin
+        uint w0 = Q[sbase + 1u], w1 = Q[sbase + 2u], w2 = Q[sbase + 3u];
+        uint it = inb >> 3u;            // 64-weight step inside the block
+        uint sc0, m0, sc1, m1;
+        k4_sm(it << 1u, w0, w1, w2, sc0, m0);
+        k4_sm((it << 1u) + 1u, w0, w1, w2, sc1, m1);
+        // gscale folds into both terms: gs*(d*sc*q - dmin*m).
+        float d1 = dm.x * float(sc0) * gs, f1 = dm.y * float(m0) * gs;
+        float d2 = dm.x * float(sc1) * gs, f2 = dm.y * float(m1) * gs;
+        uint klo = kbase + sb * 256u + it * 64u + (inb & 7u) * 4u;
+        uint khi = klo + 32u;
+        uint wd = Q[sbase + p.ng32 - 32u + inb];
+        for (uint i = 0u; i < 4u; ++i) {
+            uint ql = wd & 15u; wd >>= 4u;   // low  nibble: weight klo+i
+            uint qh = wd & 15u; wd >>= 4u;   // high nibble: weight khi+i
+            acc = fma(X[klo + i], fma(d1, float(ql), -f1), acc);
+            acc = fma(X[khi + i], fma(d2, float(qh), -f2), acc);
+        }
+    }
+    return acc;
+}
+
+void main() {
+    uint n = gl_WorkGroupID.x, t = gl_WorkGroupID.y;
+    if (n >= p.N || t >= p.T) return;
+    uint li = gl_LocalInvocationID.x;
+    partial[li] = row_dot(p.slot0 + n, t * p.K, p.gscale);
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (li < s) partial[li] += partial[li + s];
+        barrier();
+    }
+    if (li == 0u) Y[t * p.N + n] += partial[0];
+}

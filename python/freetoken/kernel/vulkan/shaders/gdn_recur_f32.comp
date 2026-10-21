@@ -1,0 +1,118 @@
+#version 450
+// gdn_recur_f32.comp — GDN state recurrence for Qwen3.5 linear attention,
+// v3: one thread per (value-head h, value-lane j). v1 (one thread/head)
+// was 12.7 ms/layer — 32 threads with ~10K sequential strided global
+// accesses each, no parallelism to hide latency. The per-j chain
+//   kv[j] -> delta[j] -> state[:,j] += kt*delta[j] -> core[j]
+// is independent ACROSS j (only the per-head RMS reduction crosses
+// threads), so one workgroup = one head: 32 groups x 128 threads, and
+// consecutive j threads touch consecutive state addresses (coalesced).
+//
+// Per-lane redundantly recomputes l2norms/gates from mixed (small ALU)
+// so the ONLY cross-lane communication is the RMS variance reduction
+// (shared score[] + svar, single-writer pattern — the multi-writer
+// shared kt/qt arrays produced all-NaN on this driver, avoided here).
+//
+// Numerics match ResidentNVFP4._gdn_host ordering:
+//   l2norm(x) = x * rsqrt(sum(x^2) + l2eps)         [ascending sums]
+//   dec = exp(-exp(alog[h]) * softplus(a[h]+dtb[h]))
+//   state[d,j] <- state[d,j] * dec                  [separate rounding]
+//   kv[j]   = sum_d (state*dec)[d,j] * kt[d]        [ascending d]
+//   state[d,j] <- state[d,j] + kt[d]*delta[j]        [separate rounding]
+//   core[j] = sum_d state[d,j] * qt[d]
+//   var = mean_j core[j]^2; pre = core*rsqrt(var+rms_eps)*normw[j]
+//         * silu(z[h,j])
+// softplus: stable branch (x>20 ? x : log(1+exp(x))) like torch.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer BufMixed { float mixed[]; }; // [C]
+layout(std430, binding = 1) readonly  buffer BufZ     { float z[]; };     // [nv*hv]
+layout(std430, binding = 2) readonly  buffer BufA     { float avec[]; };  // [nv]
+layout(std430, binding = 3) readonly  buffer BufB     { float bvec[]; };  // [nv]
+layout(std430, binding = 4) readonly  buffer BufALog  { float alog[]; };  // [nv]
+layout(std430, binding = 5) readonly  buffer BufDtB   { float dtb[]; };   // [nv]
+layout(std430, binding = 6) readonly  buffer BufNormW { float normw[]; }; // [hv]
+layout(std430, binding = 7) buffer BufState { float st[]; };              // [nv,hk,hv] RW
+layout(std430, binding = 8) writeonly buffer BufPre  { float pre[]; };    // [nv*hv]
+
+layout(push_constant) uniform Params {
+    uint C;        // conv dim (2*key_dim + nv*hv)
+    uint key_dim;  // nk*hk
+    uint nv;
+    uint hk;
+    uint hv;
+    uint rep;      // nv/nk interleave repeat
+    float scale;   // host float32 1/sqrt(hk) — bit-identical constant
+    float l2eps;   // 1e-6
+    float rms_eps; // cfg.rms_norm_eps
+} p;
+
+shared float score[128]; // core per lane (lane 0 reduces)
+shared float svar;
+
+void main() {
+    const uint h = gl_WorkGroupID.x;
+    const uint j = gl_LocalInvocationID.x;
+    if (h >= p.nv || j >= p.hv) return;
+    const uint hk = p.hk;
+    const uint hv = p.hv;
+    const uint r = h / p.rep;  // interleaved source row
+    const uint qoff = r * hk;
+    const uint koff = p.key_dim + r * hk;
+    const uint voff = 2u * p.key_dim + h * hv;
+
+    // --- per-lane l2norms (redundant across j; ascending sums) ---
+    float sq = 0.0;
+    float sk = 0.0;
+    for (uint d = 0u; d < hk; ++d) {
+        float qv = mixed[qoff + d];
+        float kv = mixed[koff + d];
+        sq += qv * qv;
+        sk += kv * kv;
+    }
+    const float rqn = inversesqrt(sq + p.l2eps);
+    const float rkn = inversesqrt(sk + p.l2eps);
+
+    // --- per-lane gates ---
+    const float beta = 1.0 / (1.0 + exp(-bvec[h]));
+    const float adt = avec[h] + dtb[h];
+    const float sp = (adt > 20.0) ? adt : log(1.0 + exp(adt));
+    const float dec = exp(-exp(alog[h]) * sp);
+
+    // --- per-j chain; reads/writes on (h, d, j) are lane-local ---
+    const uint sbase = h * hk * hv;
+    float kv = 0.0;
+    for (uint d = 0u; d < hk; ++d) {
+        const uint sidx = sbase + d * hv + j;
+        const float s0 = st[sidx];
+        const float decd = s0 * dec;             // host: state *= dec
+        st[sidx] = decd;
+        kv += decd * (mixed[koff + d] * rkn);    // host kv term
+    }
+    const float delta = (mixed[voff + j] - kv) * beta;
+    float core = 0.0;
+    for (uint d = 0u; d < hk; ++d) {
+        const uint sidx = sbase + d * hv + j;
+        const float ktd = mixed[koff + d] * rkn;
+        const float qtd = mixed[qoff + d] * rqn * p.scale;
+        st[sidx] += ktd * delta;                 // host: state += kt*delta
+        core += st[sidx] * qtd;                  // host core term
+    }
+    score[j] = core;
+    // var reduction (single writer after barrier)
+    barrier();
+    if (j == 0u) {
+        float v = 0.0;
+        for (uint jj = 0u; jj < hv; ++jj) {
+            v += score[jj] * score[jj];
+        }
+        svar = v / float(hv);
+    }
+    barrier();
+    const float rs = inversesqrt(svar + p.rms_eps);
+    const uint poff = h * hv;
+    const float zj = z[poff + j];
+    pre[poff + j] = core * rs * normw[j]
+                  * (zj / (1.0 + exp(-zj)));
+}
