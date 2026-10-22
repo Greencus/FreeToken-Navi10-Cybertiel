@@ -1383,6 +1383,94 @@ void linear_q5k_acc_resident_io_vulkan(
                                      y_handle, T, N, K, gscale, slot0);
 }
 
+// ============================================================
+// Fused 8-expert K-quant MoE dispatches (arena): the mirror of the NVFP4
+// gateup8/acc8 pair for Q4_K/Q5_K experts - a layer's 16 dispatches (8
+// gateup-silu + 8 down-accumulate) collapse to 2, and the MoE layer stops
+// interleaving 8 per-expert silu-slot buffers.  The arena is one
+// row-contiguous packed buffer per side: expert j's gateup bundle (gate
+// rows 0..N-1, up rows N..2N-1) sits at rows Ids[j]*rows_per_slot.. of
+// the gateup arena, its down matrix at rows Ids[j]*rows_per_slot.. of the
+// down arena.  Slot 0 is the engine's 0x7FFFFFFF no-content sentinel and
+// is addressed like any other slot (the engine never routes a real expert
+// there).  gscales move from the push constant to the resident float[16]
+// Gs buffer: gateup at Gs[j], acc at Gs[8+j] - the engine stores the SAME
+// fp32 value the per-expert push constant carried, so the in-shader math
+// (d*sc*gs, fma chains, tree, silu) is unchanged.
+//
+// Numeric contract (verified bit-exact by tests/kernel/vulkan/
+// test_kquant_fused.py): every (j, n) row dot, reduction and silu fold is
+// the EXACT source of the per-expert linear_q{k}_{gateup_silu,acc_
+// resident} shaders; only address sources move (Ids[j]*rows_per_slot for
+// the push-constant slot0, j*N / j*silu_N output/input offsets inside the
+// shared buffers).
+// ============================================================
+static inline const char* kquant8_shader(const std::string& qtype,
+                                         bool gateup) {
+    if (qtype == "q4_k")
+        return gateup ? "linear_q4k_gateup8_f32.comp.spv"
+                      : "linear_q4k_acc8_f32.comp.spv";
+    TORCH_CHECK(qtype == "q5_k",
+                "fused K-quant MoE dispatches support q4_k|q5_k, got: ",
+                qtype);
+    return gateup ? "linear_q5k_gateup8_f32.comp.spv"
+                  : "linear_q5k_acc8_f32.comp.spv";
+}
+
+// KQuantPC minus gscale/slot0 (both moved to the Ids/Gs buffers) plus
+// rows_per_slot (arena slot stride in packed rows).
+struct KQuant8PC {
+    uint32_t T, N, K, wpr, ng32;
+    uint32_t rows_per_slot, rowstride;
+};
+struct KQuant8AccPC {          // + silu_N (32 B)
+    uint32_t T, N, K, wpr, ng32;
+    uint32_t rows_per_slot, rowstride, silu_N;
+};
+
+static inline KQuant8PC kquant8_pc(const std::string& qtype, int64_t N,
+                                   int64_t K, int64_t rows_per_slot) {
+    KQuantPC base = kquant_pc(qtype, 1, N, K, 1.0, 0);  // wpr/ng32/rowstride
+    KQuant8PC pc{(uint32_t)1, (uint32_t)N, (uint32_t)K, base.wpr, base.ng32,
+                 (uint32_t)rows_per_slot, base.rowstride};
+    return pc;
+}
+
+// Sync fused pair (one submit each; the batch recorders below are the
+// engine path).  T = 1: decode row 0 only, like the NVFP4 fused pair.
+void linear_kquant_gateup8_io_vulkan(
+    const std::string& qtype, int64_t h_x, int64_t h_packed,
+    int64_t h_silu_all, int64_t h_ids, int64_t h_gs, int64_t N, int64_t K,
+    int64_t rows_per_slot) {
+    const char* shader = kquant8_shader(qtype, /*gateup=*/true);
+    KQuant8PC pc = kquant8_pc(qtype, N, K, rows_per_slot);
+    auto& pipe = get_pipeline(shader, 5, sizeof(pc));
+    // grid (N, 8): WG (n, j) computes expert j's gate+up row n.
+    run_kernel(pipe, {resident_buf(h_packed), resident_buf(h_x),
+                      resident_buf(h_silu_all), resident_buf(h_ids),
+                      resident_buf(h_gs)},
+               &pc, (uint32_t)N, 8u, 1);
+}
+
+void linear_kquant_acc8_io_vulkan(
+    const std::string& qtype, int64_t h_silu_all, int64_t h_packed,
+    int64_t h_y, int64_t h_ids, int64_t h_gs, int64_t N, int64_t K,
+    int64_t rows_per_slot, int64_t silu_N) {
+    TORCH_CHECK(K == silu_N,
+                "fused K-quant acc8 reads the silu vector as its K: "
+                "need K == silu_N");
+    const char* shader = kquant8_shader(qtype, /*gateup=*/false);
+    KQuant8PC base = kquant8_pc(qtype, N, K, rows_per_slot);
+    KQuant8AccPC pc{base.T, base.N, base.K, base.wpr, base.ng32,
+                    base.rows_per_slot, base.rowstride, (uint32_t)silu_N};
+    auto& pipe = get_pipeline(shader, 5, sizeof(pc));
+    // grid (N, 1): one 128-lane WG per output row computes all 8 dots.
+    run_kernel(pipe, {resident_buf(h_packed), resident_buf(h_silu_all),
+                      resident_buf(h_y), resident_buf(h_ids),
+                      resident_buf(h_gs)},
+               &pc, (uint32_t)N, 1u, 1);
+}
+
 void linear_fp8e4m3_resident_io_vulkan(
     int64_t x_handle, int64_t h_w, int64_t h_scales, int64_t y_handle,
     int64_t T, int64_t N, int64_t K, int64_t scale_cols) {
@@ -1963,6 +2051,43 @@ static void batch_kquant_io_vulkan(
                         &pc, sizeof(pc), (uint32_t)N, (uint32_t)T);
 }
 
+// Fused K-quant pair inside a batch: same contract as the sync ops above,
+// recorded (no submit).  grid (N, 8) for gateup8, (N, 1) for acc8.
+static void batch_kquant_gateup8_io_vulkan(
+    const std::string& qtype, int64_t h_x, int64_t h_packed,
+    int64_t h_silu_all, int64_t h_ids, int64_t h_gs, int64_t N, int64_t K,
+    int64_t rows_per_slot) {
+    const char* shader = kquant8_shader(qtype, /*gateup=*/true);
+    KQuant8PC pc = kquant8_pc(qtype, N, K, rows_per_slot);
+    batch_kernel_record(shader,
+                        {resident_buf(h_packed), resident_buf(h_x),
+                         resident_buf(h_silu_all), resident_buf(h_ids),
+                         resident_buf(h_gs)},
+                        {0, 0, 1, 0, 0},  // packed, X, Ids, Gs read;
+                                           // silu_all written
+                        &pc, sizeof(pc), (uint32_t)N, 8u);
+}
+
+static void batch_kquant_acc8_io_vulkan(
+    const std::string& qtype, int64_t h_silu_all, int64_t h_packed,
+    int64_t h_y, int64_t h_ids, int64_t h_gs, int64_t N, int64_t K,
+    int64_t rows_per_slot, int64_t silu_N) {
+    TORCH_CHECK(K == silu_N,
+                "fused K-quant acc8 reads the silu vector as its K: "
+                "need K == silu_N");
+    const char* shader = kquant8_shader(qtype, /*gateup=*/false);
+    KQuant8PC base = kquant8_pc(qtype, N, K, rows_per_slot);
+    KQuant8AccPC pc{base.T, base.N, base.K, base.wpr, base.ng32,
+                    base.rows_per_slot, base.rowstride, (uint32_t)silu_N};
+    batch_kernel_record(shader,
+                        {resident_buf(h_packed), resident_buf(h_silu_all),
+                         resident_buf(h_y), resident_buf(h_ids),
+                         resident_buf(h_gs)},
+                        {0, 0, 1, 0, 0},  // packed, X(silu), Ids, Gs read;
+                                           // Y written (acc is RMW)
+                        &pc, sizeof(pc), (uint32_t)N, 1u);
+}
+
 // Fused MoE-layer record for K-quant experts: the mirror of
 // batch_moe_record_vulkan, minus the NVFP4 scale buffers and minus the
 // shared-expert / download tail (those stay BF16 ops the caller records
@@ -2138,6 +2263,53 @@ static void batch_moe_fused_record_vulkan(
         gu_rows, gu_cols, rows_fused);
     batch_nvfp4_acc8_io_vulkan(
         h_silu_all, h_arena_wd, h_arena_sd, h_y_acc, h_ids, h_gs,
+        dn_rows, dn_cols, rows_down, silu_N);
+    batch_bf16_io_vulkan(h_x_fused, sg_w, sg_w, h_sg, 1, sg_rows, sg_cols, false);
+    batch_bf16_io_vulkan(h_x_fused, su_w, su_w, h_su, 1, su_rows, su_cols, false);
+    batch_bf16_io_vulkan(h_x_fused, gsc_w, gsc_w, h_gsc, 1, gsc_rows, gsc_cols, false);
+    batch_swiglu_io_vulkan(h_sg, h_su, h_x3, gate_rows);
+    batch_bf16_io_vulkan(h_x3, sdp_w, sdp_w, h_sdown, 1, sdp_rows, sdp_cols, false);
+    batch_download_vulkan(h_y_acc, acc_out, 0);
+    batch_download_vulkan(h_sdown, sd_out, 0);
+    batch_download_vulkan(h_gsc, gsc_out, 0);
+}
+
+// K-quant fused MoE-layer record: the mirror of batch_moe_fused_record for
+// Q4_K/Q5_K experts.  2 fused dispatches (gateup8 over the packed gateup
+// arena + acc8 over the packed down arena, both indexed by the resident
+// u32[8] ids buffers and the resident float[16] gs buffer) + the UNCHANGED
+// shared-expert tail (gate/up/gsc dense + swiglu fold + shared down + 3
+// downloads) in one pybind crossing.  The tail is recorded in the exact
+// same order as batch_moe_kquant_record followed by the caller's own tail
+// calls (the K-quant record stops at the routed 16), so swapping this in
+// for that pair of call sites is bit-identical.  Dimensions mirror the
+// NVFP4 record: gu_rows = gate row count N (the bundle holds 2N rows),
+// rows_fused/rows_down are the arena slot strides, silu_N = gu_rows (the
+// down K is the silu vector length).
+static void batch_moe_kquant_fused_record_vulkan(
+    int64_t h_x_fused, int64_t h_y_acc,
+    int64_t h_sg, int64_t h_su, int64_t h_gsc,
+    int64_t h_x3, int64_t h_sdown,
+    const std::string& qtype,
+    int64_t h_silu_all,
+    int64_t h_arena_wf, int64_t h_arena_wd,
+    int64_t h_ids_gu, int64_t h_ids_dn, int64_t h_gs,
+    int64_t gu_rows, int64_t gu_cols, int64_t rows_fused,
+    int64_t dn_rows, int64_t dn_cols, int64_t rows_down,
+    int64_t silu_N,
+    int64_t sg_w, int64_t sg_rows, int64_t sg_cols,
+    int64_t su_w, int64_t su_rows, int64_t su_cols,
+    int64_t gsc_w, int64_t gsc_rows, int64_t gsc_cols,
+    int64_t sdp_w, int64_t sdp_rows, int64_t sdp_cols,
+    int64_t gate_rows,
+    torch::Tensor acc_out, torch::Tensor sd_out, torch::Tensor gsc_out) {
+    TORCH_CHECK(g_batch.active,
+                "batch_moe_kquant_fused_record outside an open batch");
+    batch_kquant_gateup8_io_vulkan(
+        qtype, h_x_fused, h_arena_wf, h_silu_all, h_ids_gu, h_gs,
+        gu_rows, gu_cols, rows_fused);
+    batch_kquant_acc8_io_vulkan(
+        qtype, h_silu_all, h_arena_wd, h_y_acc, h_ids_dn, h_gs,
         dn_rows, dn_cols, rows_down, silu_N);
     batch_bf16_io_vulkan(h_x_fused, sg_w, sg_w, h_sg, 1, sg_rows, sg_cols, false);
     batch_bf16_io_vulkan(h_x_fused, su_w, su_w, h_su, 1, su_rows, su_cols, false);
@@ -3326,6 +3498,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("x_handle"), py::arg("packed_handle"), py::arg("y_handle"),
           py::arg("T"), py::arg("N"), py::arg("K"), py::arg("gscale"),
           py::arg("slot0") = 0);
+    m.def("linear_kquant_gateup8_io", &linear_kquant_gateup8_io_vulkan,
+          "Fused 8-expert K-quant gate+up+SiLU over a packed arena (qtype = "
+          "q4_k|q5_k): grid (N, 8), expert j at arena slot Ids[j], gs at "
+          "Gs[j]; bit-identical to 8x linear_q*k_gateup_silu_io.",
+          py::arg("qtype"), py::arg("x_handle"), py::arg("packed_handle"),
+          py::arg("silu_handle"), py::arg("ids_handle"), py::arg("gs_handle"),
+          py::arg("N"), py::arg("K"), py::arg("rows_per_slot"));
+    m.def("linear_kquant_acc8_io", &linear_kquant_acc8_io_vulkan,
+          "Fused 8-expert K-quant down-accumulate over a packed arena: grid "
+          "(N, 1), sums the 8 experts in canonical order into one Y write; "
+          "bit-identical to 8x linear_q*k_acc_resident_io (Y pre-filled).",
+          py::arg("qtype"), py::arg("silu_handle"), py::arg("packed_handle"),
+          py::arg("y_handle"), py::arg("ids_handle"), py::arg("gs_handle"),
+          py::arg("N"), py::arg("K"), py::arg("rows_per_slot"),
+          py::arg("silu_N"));
     m.def("linear_fp8e4m3_resident_io", &linear_fp8e4m3_resident_io_vulkan,
           "FP32 linear output with resident block-scaled FP8 E4M3 weights.",
           py::arg("x_handle"), py::arg("w_handle"),
@@ -3383,6 +3570,45 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("gu_rows"), py::arg("gu_cols"), py::arg("dn_w"),
           py::arg("dn_scale"), py::arg("dn_rows"), py::arg("dn_cols"),
           py::arg("gu_slot0"), py::arg("dn_slot0"));
+    m.def("batch_kquant_gateup8_io", &batch_kquant_gateup8_io_vulkan,
+          "Record the fused 8-expert K-quant gateup+SiLU dispatch (grid "
+          "(N, 8) over the packed arena, Ids/Gs indexed) into the open "
+          "batch - 1 dispatch instead of 8.",
+          py::arg("qtype"), py::arg("x_handle"), py::arg("packed_handle"),
+          py::arg("silu_handle"), py::arg("ids_handle"), py::arg("gs_handle"),
+          py::arg("N"), py::arg("K"), py::arg("rows_per_slot"));
+    m.def("batch_kquant_acc8_io", &batch_kquant_acc8_io_vulkan,
+          "Record the fused 8-expert K-quant down-accumulate dispatch (grid "
+          "(N, 1) over the packed arena) into the open batch - 1 dispatch "
+          "instead of 8; Y must be pre-filled (batch_fill).",
+          py::arg("qtype"), py::arg("silu_handle"), py::arg("packed_handle"),
+          py::arg("y_handle"), py::arg("ids_handle"), py::arg("gs_handle"),
+          py::arg("N"), py::arg("K"), py::arg("rows_per_slot"),
+          py::arg("silu_N"));
+    m.def("batch_moe_kquant_fused_record", &batch_moe_kquant_fused_record_vulkan,
+          "K-quant fused MoE layer record: 1 fused 8-expert gateup+silu + 1 "
+          "fused 8-expert down-accumulate over the packed arenas (Ids/Gs "
+          "indexed) + shared gate/up/gsc + swiglu fold + shared down + 3 "
+          "downloads in one call - drop-in for batch_moe_kquant_record "
+          "followed by the caller's shared-expert tail (2 dispatches "
+          "instead of 16 for the routed experts).",
+          py::call_guard<py::gil_scoped_release>(),
+          py::arg("h_x_fused"), py::arg("h_y_acc"),
+          py::arg("h_sg"), py::arg("h_su"), py::arg("h_gsc"),
+          py::arg("h_x3"), py::arg("h_sdown"),
+          py::arg("qtype"),
+          py::arg("h_silu_all"),
+          py::arg("h_arena_wf"), py::arg("h_arena_wd"),
+          py::arg("h_ids_gu"), py::arg("h_ids_dn"), py::arg("h_gs"),
+          py::arg("gu_rows"), py::arg("gu_cols"), py::arg("rows_fused"),
+          py::arg("dn_rows"), py::arg("dn_cols"), py::arg("rows_down"),
+          py::arg("silu_N"),
+          py::arg("sg_w"), py::arg("sg_rows"), py::arg("sg_cols"),
+          py::arg("su_w"), py::arg("su_rows"), py::arg("su_cols"),
+          py::arg("gsc_w"), py::arg("gsc_rows"), py::arg("gsc_cols"),
+          py::arg("sdp_w"), py::arg("sdp_rows"), py::arg("sdp_cols"),
+          py::arg("gate_rows"),
+          py::arg("acc_out"), py::arg("sd_out"), py::arg("gsc_out"));
     m.def("batch_bf16_io", &batch_bf16_io_vulkan,
           "Record a BF16 dense matvec dispatch into the open batch.",
           py::arg("x_handle"), py::arg("h_w"), py::arg("h_b"),

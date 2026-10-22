@@ -1,0 +1,110 @@
+#version 450
+// Fused 8-expert Q4_K gate+up with SiLU fold (MUL_MAT_ID-style, arena).
+// ONE dispatch replaces the 8 per-expert linear_q4k_gateup_silu dispatches
+// of a layer.  Grid = (N gate rows, 8 experts): the workgroup (n, j) computes
+// expert j's gate[n] and up[n] from the per-layer packed arena and writes
+// silu(gate)*up into rows [j*N, (j+1)*N) of the caller's silu-all scratch.
+//
+// Numerics are bit-transparent vs the 8-dispatch path: row_dot is the EXACT
+// source of linear_q4k_gateup_silu_f32.comp (same lane/word split,
+// super-block indexing, k4_sm 6-bit extraction, FMA chain, two-tree gate+up
+// reduction, silu = s/(1+exp(-s))).  Per expert only the row base
+// (Ids[j]*rows_per_slot instead of the push-constant slot0), the gscale
+// source (Gs[j] instead of the push constant) and the output row (j*N + n
+// inside one shared silu buffer instead of row n of a per-expert slot
+// buffer) move - pure address/value plumbing: same values, same order,
+// same result.
+//
+// Bindings:
+//   0 = arena packed Q4_K bytes (per slot: gate rows 0..N-1, up rows
+//       N..2N-1; slot stride = rows_per_slot rows of rowstride words)
+//   1 = X (fp32 [K], T = 1)
+//   2 = Y (fp32 [8*N]; expert j -> [j*N ..))
+//   3 = Ids u32[8] (expert j -> slot index; slot 0 is the engine's
+//       0x7FFFFFFF no-content sentinel and is addressed like any slot)
+//   4 = Gs float[16] (gateup scale at Gs[j])
+// Push: {T, N, K, wpr, ng32, rows_per_slot, rowstride} (28 B); T/K are
+// informational (wpr/ng32 are precomputed host-side, T = 1 for decode).
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer QBuf { uint Q[]; };
+layout(std430,binding=1) readonly buffer XBuf { float X[]; };
+layout(std430,binding=2) writeonly buffer YBuf { float Y[]; };
+layout(std430,binding=3) readonly buffer IBuf { uint Ids[]; };
+layout(std430,binding=4) readonly buffer GBuf { float Gs[]; };
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint wpr; uint ng32;
+    uint rows_per_slot; uint rowstride;
+} p;
+shared float partial[128];
+shared float partial_u[128];
+
+uint byte3(uint i, uint w0, uint w1, uint w2) {
+    return i < 4u ? ((w0 >> (8u * (i & 3u))) & 255u)
+         : i < 8u ? ((w1 >> (8u * (i & 3u))) & 255u)
+                  : ((w2 >> (8u * (i & 3u))) & 255u);
+}
+
+void k4_sm(uint j, uint w0, uint w1, uint w2, out uint sc, out uint m) {
+    uint qj = byte3(j, w0, w1, w2);
+    uint qp = byte3(j + 4u, w0, w1, w2);
+    if (j < 4u) {
+        sc = qj & 63u;
+        m = qp & 63u;
+    } else {
+        uint qm = byte3(j - 4u, w0, w1, w2);
+        sc = (qp & 15u) | ((qm >> 6u) << 4u);
+        m = (qp >> 4u) | ((qj >> 6u) << 4u);
+    }
+}
+
+// Per-lane dot of X[kbase,*] with packed row `row`; the caller reduces.
+float row_dot(uint row, uint kbase, float gs) {
+    uint li = gl_LocalInvocationID.x;
+    uint wbase = row * p.rowstride;
+    float acc = 0.0;
+    for (uint w = li; w < p.wpr; w += 128u) {
+        uint sb = w >> 5u;
+        uint inb = w & 31u;
+        uint sbase = wbase + sb * p.ng32;
+        vec2 dm = unpackHalf2x16(Q[sbase]);
+        uint w0 = Q[sbase + 1u], w1 = Q[sbase + 2u], w2 = Q[sbase + 3u];
+        uint it = inb >> 3u;
+        uint sc0, m0, sc1, m1;
+        k4_sm(it << 1u, w0, w1, w2, sc0, m0);
+        k4_sm((it << 1u) + 1u, w0, w1, w2, sc1, m1);
+        float d1 = dm.x * float(sc0) * gs, f1 = dm.y * float(m0) * gs;
+        float d2 = dm.x * float(sc1) * gs, f2 = dm.y * float(m1) * gs;
+        uint klo = kbase + sb * 256u + it * 64u + (inb & 7u) * 4u;
+        uint khi = klo + 32u;
+        uint wd = Q[sbase + p.ng32 - 32u + inb];
+        for (uint i = 0u; i < 4u; ++i) {
+            uint ql = wd & 15u; wd >>= 4u;
+            uint qh = wd & 15u; wd >>= 4u;
+            acc = fma(X[klo + i], fma(d1, float(ql), -f1), acc);
+            acc = fma(X[khi + i], fma(d2, float(qh), -f2), acc);
+        }
+    }
+    return acc;
+}
+
+void main() {
+    uint n = gl_WorkGroupID.x, j = gl_WorkGroupID.y;
+    if (n >= p.N || j >= 8u) return;
+    uint li = gl_LocalInvocationID.x;
+    uint slot0 = Ids[j] * p.rows_per_slot;
+    float gs = Gs[j];
+    partial[li] = row_dot(slot0 + n, 0u, gs);
+    partial_u[li] = row_dot(slot0 + n + p.N, 0u, gs);
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (li < s) {
+            partial[li] += partial[li + s];
+            partial_u[li] += partial_u[li + s];
+        }
+        barrier();
+    }
+    if (li == 0u) {
+        float s = partial[0];
+        Y[j * p.N + n] = (s / (1.0 + exp(-s))) * partial_u[0];
+    }
+}

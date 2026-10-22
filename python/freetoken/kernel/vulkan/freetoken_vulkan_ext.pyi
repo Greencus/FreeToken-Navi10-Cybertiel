@@ -79,6 +79,18 @@ def batch_gdn_recur_io(h_mixed: int, h_z: int, h_a: int, h_b: int, h_alog: int, 
     ...
 
 
+def batch_kquant_acc8_io(qtype: str, silu_handle: int, packed_handle: int, y_handle: int, ids_handle: int, gs_handle: int, N: int, K: int, rows_per_slot: int, silu_N: int) -> None:
+    """Record the fused 8-expert K-quant down-accumulate dispatch (grid (N, 1) over the packed arena) into the open batch - 1 dispatch instead of 8; Y must be pre-filled (batch_fill).
+    """
+    ...
+
+
+def batch_kquant_gateup8_io(qtype: str, x_handle: int, packed_handle: int, silu_handle: int, ids_handle: int, gs_handle: int, N: int, K: int, rows_per_slot: int) -> None:
+    """Record the fused 8-expert K-quant gateup+SiLU dispatch (grid (N, 8) over the packed arena, Ids/Gs indexed) into the open batch - 1 dispatch instead of 8.
+    """
+    ...
+
+
 def batch_kquant_io(qtype: str, kind: str, h_packed: int, x_handle: int, y_handle: int, T: int, N: int, K: int, gscale: float, slot0: int = 0) -> None:
     """Record a K-quant matvec dispatch (qtype = q4_k|q5_k|q8_0, kind = plain|gateup|acc; no separate scale buffer).
     """
@@ -87,6 +99,12 @@ def batch_kquant_io(qtype: str, kind: str, h_packed: int, x_handle: int, y_handl
 
 def batch_moe_fused_record(h_x_fused: int, h_y_acc: int, h_sg: int, h_su: int, h_gsc: int, h_x3: int, h_sdown: int, h_silu_all: int, h_arena_wf: int, h_arena_sf: int, h_arena_wd: int, h_arena_sd: int, h_ids: int, h_gs: int, gu_rows: int, gu_cols: int, rows_fused: int, dn_rows: int, dn_cols: int, rows_down: int, silu_N: int, sg_w: int, sg_rows: int, sg_cols: int, su_w: int, su_rows: int, su_cols: int, gsc_w: int, gsc_rows: int, gsc_cols: int, sdp_w: int, sdp_rows: int, sdp_cols: int, gate_rows: int, acc_out: torch.Tensor, sd_out: torch.Tensor, gsc_out: torch.Tensor) -> None:
     """Record a full MoE layer with the fused MUL_MAT_ID-style dispatches (1 fused 8-expert gateup+silu + 1 fused 8-expert down-accumulate, indexed by the resident u32[8] ids buffer) plus the shared gate/up/gate + swiglu fold + shared down + 3 downloads in one call.
+    """
+    ...
+
+
+def batch_moe_kquant_fused_record(h_x_fused: int, h_y_acc: int, h_sg: int, h_su: int, h_gsc: int, h_x3: int, h_sdown: int, qtype: str, h_silu_all: int, h_arena_wf: int, h_arena_wd: int, h_ids_gu: int, h_ids_dn: int, h_gs: int, gu_rows: int, gu_cols: int, rows_fused: int, dn_rows: int, dn_cols: int, rows_down: int, silu_N: int, sg_w: int, sg_rows: int, sg_cols: int, su_w: int, su_rows: int, su_cols: int, gsc_w: int, gsc_rows: int, gsc_cols: int, sdp_w: int, sdp_rows: int, sdp_cols: int, gate_rows: int, acc_out: torch.Tensor, sd_out: torch.Tensor, gsc_out: torch.Tensor) -> None:
+    """K-quant fused MoE layer record: 1 fused 8-expert gateup+silu + 1 fused 8-expert down-accumulate over the packed arenas (Ids/Gs indexed) + shared gate/up/gsc + swiglu fold + shared down + 3 downloads in one call - drop-in for batch_moe_kquant_record followed by the caller's shared-expert tail (2 dispatches instead of 16 for the routed experts).
     """
     ...
 
@@ -267,6 +285,18 @@ def linear_fp16_resident_io(x_handle: int, w_handle: int, b_handle: int, y_handl
 
 def linear_fp8e4m3_resident_io(x_handle: int, w_handle: int, scales_handle: int, y_handle: int, T: int, N: int, K: int, scale_cols: int) -> None:
     """FP32 linear output with resident block-scaled FP8 E4M3 weights.
+    """
+    ...
+
+
+def linear_kquant_acc8_io(qtype: str, silu_handle: int, packed_handle: int, y_handle: int, ids_handle: int, gs_handle: int, N: int, K: int, rows_per_slot: int, silu_N: int) -> None:
+    """Fused 8-expert K-quant down-accumulate over a packed arena: grid (N, 1), sums the 8 experts in canonical order into one Y write; bit-identical to 8x linear_q*k_acc_resident_io (Y pre-filled).
+    """
+    ...
+
+
+def linear_kquant_gateup8_io(qtype: str, x_handle: int, packed_handle: int, silu_handle: int, ids_handle: int, gs_handle: int, N: int, K: int, rows_per_slot: int) -> None:
+    """Fused 8-expert K-quant gate+up+SiLU over a packed arena (qtype = q4_k|q5_k): grid (N, 8), expert j at arena slot Ids[j], gs at Gs[j]; bit-identical to 8x linear_q*k_gateup_silu_io.
     """
     ...
 

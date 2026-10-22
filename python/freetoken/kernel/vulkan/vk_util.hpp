@@ -20,6 +20,8 @@
 #include <stdexcept>
 #include <vector>
 #include <unordered_map>
+#include <thread>
+#include <algorithm>
 
 namespace vku {
 
@@ -275,7 +277,17 @@ inline Buffer make_buffer(const Context& ctx, VkDeviceSize size,
     if ((mt_flags == 0) &&
         !find_memory_type_opt(ctx.physical_device, mr.memoryTypeBits, props,
                               0, &mt, &mt_flags)) {
-        std::fprintf(stderr, "no matching memory type\n"); std::exit(1);
+        // Preferred (staging asks for HOST_CACHED) not offered: degrade to
+        // any type matching the rest instead of failing the device.
+        props &= ~VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        if (!find_memory_type_opt(ctx.physical_device, mr.memoryTypeBits,
+                                  props, 0, &mt, &mt_flags)) {
+            std::fprintf(stderr, "no matching memory type\n"); std::exit(1);
+        }
+    }
+    if (std::getenv("FREETOKEN_VULKAN_LOG_MEMTYPE")) {
+        std::fprintf(stderr, "[vk] alloc %llu B props=0x%x -> type %u flags=0x%x\n",
+                     (unsigned long long)size, props, mt, mt_flags);
     }
 
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -350,17 +362,20 @@ inline void host_write_end(const Context& ctx, Buffer& b,
     if (p != b.mapped) vkUnmapMemory(ctx.device, b.mem);
 }
 
-// Host-visible staging/scratch buffer. Asks for HOST_VISIBLE without
-// HOST_COHERENT so a driver that offers a non-coherent host type gets one
-// (exact-range flush instead of a whole-range one); RADV/Navi10 only has
-// coherent host types, so this resolves to the same type as before.
+// Host-visible staging/scratch buffer. Prefers HOST_VISIBLE|HOST_CACHED:
+// on this device that is coherent write-back system RAM, and the CPU read
+// of a download staging matters - the non-cached type the old preference
+// resolved to reads back at ~340 MB/s (aperture), which cost the 63 MB
+// GDN snapshot pull-down 185 ms. Falls back through the same chain as
+// before (non-coherent host type, then any coherent host type).
 inline Buffer make_host_ssbo(const Context& ctx, VkDeviceSize size,
                              bool map_persistently = true) {
     return make_buffer(ctx, size,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
             | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
             | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, map_persistently);
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+            | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, map_persistently);
 }
 
 // Device-local buffer, resides in VRAM. Faster for GPU compute but not
@@ -526,6 +541,62 @@ struct BufferPool {
     }
 };
 
+// ------------------------------------------------------------
+// Large host-read helper for download staging.
+//
+// Second-order on top of the HOST_CACHED staging choice (that was the
+// 21x: uncached type read at 340 MB/s, cached at ~10 GB/s - see
+// make_host_ssbo): unrolled movntdqa loads win another ~15% on big
+// readbacks (63 MB pull-down 5.80 -> 4.95 ms), byte-identical to memcpy.
+// movntdqa is SSE4.1; without it, plain memcpy. Tail included.
+// ------------------------------------------------------------
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__))
+#define VKU_HAS_X86_INTRIN 1
+#include <immintrin.h>
+
+// Per-function target attribute: only this helper gets SSE4.1 codegen;
+// the rest of the extension keeps the baseline ISA.
+inline void memcpy_bar_nt(char* d, const char* s, size_t n)
+    __attribute__((target("sse4.1")));
+inline void memcpy_bar_nt(char* d, const char* s, size_t n) {
+    // movntdqa needs a 16-byte-aligned source; byte-prologue to reach it.
+    size_t i = 0;
+    while (i < n && (reinterpret_cast<uintptr_t>(s + i) & 15u) != 0) {
+        d[i] = s[i];
+        ++i;
+    }
+    while (i + 64 <= n) {
+        char* sp = const_cast<char*>(s + i);
+        __m128i a = _mm_stream_load_si128(reinterpret_cast<__m128i*>(sp));
+        __m128i b = _mm_stream_load_si128(
+            reinterpret_cast<__m128i*>(sp + 16));
+        __m128i c = _mm_stream_load_si128(
+            reinterpret_cast<__m128i*>(sp + 32));
+        __m128i e = _mm_stream_load_si128(
+            reinterpret_cast<__m128i*>(sp + 48));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(d + i), a);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(d + i + 16), b);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(d + i + 32), c);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(d + i + 48), e);
+        i += 64;
+    }
+    std::memcpy(d + i, s + i, n - i);
+}
+#endif
+
+inline void memcpy_bar(void* dst0, const void* src0, size_t n) {
+#ifdef VKU_HAS_X86_INTRIN
+    static const bool has_sse41 = __builtin_cpu_supports("sse4.1");
+    if (has_sse41 && n >= 1024) {
+        memcpy_bar_nt(static_cast<char*>(dst0),
+                      static_cast<const char*>(src0), n);
+        return;
+    }
+#endif
+    std::memcpy(dst0, src0, n);
+}
+
 inline void upload(const Context& ctx, Buffer& b, const void* src, VkDeviceSize bytes) {
     if (bytes > b.size) {
         throw std::runtime_error("upload exceeds Vulkan buffer capacity");
@@ -541,13 +612,13 @@ inline void download(const Context& ctx, Buffer& b, void* dst, VkDeviceSize byte
     }
     if (b.mapped) {
         invalidate_host_read(ctx, b, 0, bytes);
-        std::memcpy(dst, b.mapped, (size_t)bytes);
+        memcpy_bar(dst, b.mapped, (size_t)bytes);
         return;
     }
     void* p;
     VKU_CHECK(vkMapMemory(ctx.device, b.mem, 0, range_end(ctx, b, 0, bytes), 0, &p));
     invalidate_host_read(ctx, b, 0, bytes);
-    std::memcpy(dst, p, (size_t)bytes);
+    memcpy_bar(dst, p, (size_t)bytes);
     vkUnmapMemory(ctx.device, b.mem);
 }
 
