@@ -360,8 +360,12 @@ class GgufArenaMixin:
         ext = self.ext
         ext.batch_upload_async_drain()
         freed = self._kq_reclaim_lru()
-        if self._exp_cache_budget > _KQ_LRU_CAP_MB:
-            self._exp_cache_budget = _KQ_LRU_CAP_MB
+        # _exp_cache_budget is BYTES (cache_mb * 1024 * 1024 at init);
+        # capping with the raw MiB constant would make every _cache_put
+        # self-evict and free the handle it just uploaded.
+        cap_bytes = _KQ_LRU_CAP_MB * 2**20
+        if self._exp_cache_budget > cap_bytes:
+            self._exp_cache_budget = cap_bytes
         self._kq_arena_alloc_all()
         self._kq_allocated = True
         print(
@@ -375,7 +379,8 @@ class GgufArenaMixin:
             f"gpu_router={int(self._gpu_router)})", flush=True)
 
     def _kq_cache_cap(self) -> int:
-        return int(self._exp_cache_budget)
+        """LRU cap in MiB (display only; ``_exp_cache_budget`` is bytes)."""
+        return int(self._exp_cache_budget) // 2**20
 
     # ------------------------------------------------------------------
     # packs + slot assignment
