@@ -9,6 +9,7 @@ packed bytes sit in the memory-mapped file).
 from __future__ import annotations
 
 import functools
+import mmap
 import os
 import re
 import struct
@@ -107,7 +108,16 @@ def _field_value(reader, name: str) -> Any:
 def _reader(model_path: str):
     from freetoken.third_party import gguf
 
-    return gguf.GGUFReader(model_path)
+    reader = gguf.GGUFReader(model_path)
+    # Publish the np.memmap's mmap to madvise.py: fadvise(DONTNEED) skips
+    # pages that still have PTEs, so evicting a range needs this mapping to
+    # zap them first. Lazy import: madvise imports this module.
+    mapping = getattr(getattr(reader, "data", None), "_mmap", None)
+    if isinstance(mapping, mmap.mmap):
+        from . import madvise
+
+        madvise.register_mapping(model_path, mapping)
+    return reader
 
 
 @functools.cache
