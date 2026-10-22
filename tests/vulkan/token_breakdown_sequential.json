@@ -1,0 +1,657 @@
+{
+ "label": "sequential",
+ "batched": false,
+ "args": {
+  "model": "/tmp/opencode/CyberTiel.gguf",
+  "tokens": 16,
+  "warmup": 4,
+  "runs": 3,
+  "max_len": 4096,
+  "ctx": 0,
+  "sequential": true,
+  "label": "sequential",
+  "json": "tests/vulkan/token_breakdown_sequential.json",
+  "no_calib": false,
+  "calib": {
+   "empty_submit_ms": 0.0460108399965975,
+   "batch_h2d_ms": 0.7715864000147121,
+   "batch_h2d_gbs": 11.561315543470858,
+   "batch_d2h_ms": 23.76174800001536,
+   "batch_d2h_gbs": 0.3537148326193275,
+   "sync_h2d_gbs": 13.12629054888243,
+   "sync_d2h_gbs": 0.35229882639496907,
+   "calib_bytes": 8388608
+  }
+ },
+ "runs": [
+  {
+   "label": "sequential",
+   "batched": false,
+   "tokens": 16,
+   "prefill_s": 2.6973455410002316,
+   "s_per_tok": 0.30208058018749284,
+   "tok_per_s": 3.3103749978874126,
+   "per_token_ms": [
+    279.8510620000343,
+    310.5125979996046,
+    310.37278799976775,
+    360.33506100011437,
+    312.89515200023743,
+    296.65398699989964,
+    303.2599299999674,
+    279.1963179997765,
+    282.7182129999528,
+    357.4152559999675,
+    273.72788599996056,
+    261.02223299994876,
+    286.7918440001631,
+    285.451490000014,
+    310.1193389998116,
+    319.6128019999378
+   ],
+   "per_token_ms_median": 299.95695849993353,
+   "buckets_ms": {
+    "host_embed": 0.12124687495429498,
+    "host_rms": 2.422994499994502,
+    "sync": 216.07810006230466,
+    "host_glue": 5.00255431268215,
+    "host_gdn": 17.44235350045642,
+    "host_fetch": 28.623029939154776,
+    "host_moe": 27.08789781038945,
+    "host_attn": 4.335422874760297
+   },
+   "buckets_ms_total": {
+    "host_embed": 0.00012124687495429498,
+    "host_rms": 0.002422994499994502,
+    "sync": 0.21607810006230466,
+    "host_glue": 0.00500255431268215,
+    "host_gdn": 0.01744235350045642,
+    "host_fetch": 0.028623029939154776,
+    "host_moe": 0.02708789781038945,
+    "host_attn": 0.004335422874760297
+   },
+   "calls_per_tok": {
+    "host_embed": 1.0,
+    "host_rms": 81.0,
+    "sync": 4198.5,
+    "host_glue": 351.0,
+    "host_gdn": 30.0,
+    "host_fetch": 960.0,
+    "host_moe": 40.0,
+    "host_attn": 10.0
+   },
+   "samples_ms": {
+    "sync": {
+     "n": 67176,
+     "mean": 0.05146554723408471,
+     "median": 0.03803999970841687,
+     "p90": 0.07781100021020393,
+     "max": 3.0194099999789614
+    }
+   },
+   "remainder_ms": 0.966980312796295,
+   "bytes_up_mib": 171.921875,
+   "bytes_down_mib": 7.243804931640625,
+   "submits": 0.0,
+   "sync_roundtrips": 4198.5,
+   "fence_ms_total": 0.0,
+   "derived": {
+    "empty_submit_ms": 0.0460108399965975,
+    "transfer_est_ms": 35.2940798540535,
+    "fixed_submit_est_ms": 193.1765117257146,
+    "kernel_est_ms": 180.78402020825115,
+    "h2d_gbs": 13.12629054888243,
+    "d2h_gbs": 0.35229882639496907
+   },
+   "engine_stats": {
+    "pin_up": 0.02239380075039321,
+    "pin_kernel": 0.030507411435792164,
+    "pin_down": 0.024434492250321682,
+    "exp_x": 0.039260294999849066,
+    "exp_kernel": 0.042288185873729844,
+    "exp_down": 0.04800866218840838,
+    "exp_packed": 0.02117710418778529,
+    "exp_up": 0.024998213375482692
+   },
+   "engine_stat_calls": {
+    "pin_up": 351.0,
+    "pin_kernel": 351.0,
+    "pin_down": 351.0,
+    "exp_x": 960.0,
+    "cache_hit": 694.5,
+    "exp_kernel": 960.0,
+    "exp_down": 960.0,
+    "cache_miss": 265.5,
+    "exp_packed": 265.5,
+    "exp_up": 265.5,
+    "cache_evict": 270.5625
+   },
+   "counters_delta": {
+    "batch_submit_count": [
+     0,
+     0
+    ],
+    "batch_barrier_stats": [
+     0,
+     0
+    ],
+    "desc_cache_stats": [
+     947,
+     1384,
+     947,
+     12970,
+     8006,
+     345
+    ],
+    "batch_upload_async_stats": [
+     0,
+     0
+    ],
+    "batch_deferred_stats": [
+     0,
+     0,
+     0,
+     0
+    ]
+   },
+   "resident_mib": 6299.619632720947,
+   "cache_hit": 11112,
+   "cache_miss": 4248,
+   "ids": [
+    6749,
+    506,
+    279,
+    21482,
+    13,
+    353,
+    3272,
+    883,
+    279,
+    1834,
+    13,
+    353,
+    3272,
+    883,
+    279,
+    1208
+   ],
+   "env": "cached=12222MiB mem_avail=9014MiB load=[3.57, 2.94, 2.78] rss_max=12711MiB",
+   "rss_mb": 12711.3203125,
+   "gpu_router": false,
+   "exp_cache_budget_mib": 2048.0,
+   "report_stats": "exp_down: total=0.768s calls=15360 avg=0.050ms\nexp_kernel: total=0.677s calls=15360 avg=0.044ms\nexp_packed: total=0.339s calls=4248 avg=0.080ms\nexp_up: total=0.400s calls=4248 avg=0.094ms\nexp_x: total=0.628s calls=15360 avg=0.041ms\npin_down: total=0.391s calls=5616 avg=0.070ms\npin_kernel: total=0.488s calls=5616 avg=0.087ms\npin_up: total=0.358s calls=5616 avg=0.064ms"
+  },
+  {
+   "label": "sequential",
+   "batched": false,
+   "tokens": 16,
+   "prefill_s": 2.4214246249998723,
+   "s_per_tok": 0.28948151087502083,
+   "tok_per_s": 3.45445205456225,
+   "per_token_ms": [
+    294.8432360003608,
+    318.51269600019805,
+    317.2865650003587,
+    309.34120700021595,
+    307.51750099989295,
+    301.3456919998134,
+    284.14985500012335,
+    273.8217440000881,
+    277.2590289996515,
+    282.17546599989873,
+    243.7689829998817,
+    252.16339600001447,
+    261.8201599998429,
+    265.85455899976296,
+    298.48952500015,
+    340.098410000337
+   ],
+   "per_token_ms_median": 289.49654550024206,
+   "buckets_ms": {
+    "host_embed": 0.1147805624555076,
+    "host_rms": 2.3956681251036116,
+    "sync": 217.2101911853872,
+    "host_glue": 4.894173687603143,
+    "host_gdn": 15.29737181215296,
+    "host_fetch": 18.6909208136683,
+    "host_moe": 26.7596361886433,
+    "host_attn": 3.1711783121863846
+   },
+   "buckets_ms_total": {
+    "host_embed": 0.0001147805624555076,
+    "host_rms": 0.0023956681251036116,
+    "sync": 0.2172101911853872,
+    "host_glue": 0.004894173687603143,
+    "host_gdn": 0.01529737181215296,
+    "host_fetch": 0.0186909208136683,
+    "host_moe": 0.0267596361886433,
+    "host_attn": 0.0031711783121863846
+   },
+   "calls_per_tok": {
+    "host_embed": 1.0,
+    "host_rms": 81.0,
+    "sync": 4198.5,
+    "host_glue": 351.0,
+    "host_gdn": 30.0,
+    "host_fetch": 960.0,
+    "host_moe": 40.0,
+    "host_attn": 10.0
+   },
+   "samples_ms": {
+    "sync": {
+     "n": 67176,
+     "mean": 0.05173518904022561,
+     "median": 0.037569999676634325,
+     "p90": 0.07747100016786135,
+     "max": 3.175440999712009
+    }
+   },
+   "remainder_ms": 0.947590187820424,
+   "bytes_up_mib": 171.921875,
+   "bytes_down_mib": 7.243804931640625,
+   "submits": 0.0,
+   "sync_roundtrips": 4198.5,
+   "fence_ms_total": 0.0,
+   "derived": {
+    "empty_submit_ms": 0.0460108399965975,
+    "transfer_est_ms": 35.2940798540535,
+    "fixed_submit_est_ms": 193.1765117257146,
+    "kernel_est_ms": 181.9161113313337,
+    "h2d_gbs": 13.12629054888243,
+    "d2h_gbs": 0.35229882639496907
+   },
+   "engine_stats": {
+    "pin_up": 0.02320607993675594,
+    "pin_kernel": 0.031044864312121945,
+    "pin_down": 0.023912572438007373,
+    "exp_x": 0.03885006825126425,
+    "exp_kernel": 0.042449121188184336,
+    "exp_down": 0.04817813306272001,
+    "exp_packed": 0.011077474999268588,
+    "exp_up": 0.02511278162469921
+   },
+   "engine_stat_calls": {
+    "pin_up": 351.0,
+    "pin_kernel": 351.0,
+    "pin_down": 351.0,
+    "exp_x": 960.0,
+    "cache_hit": 694.5,
+    "exp_kernel": 960.0,
+    "exp_down": 960.0,
+    "cache_miss": 265.5,
+    "exp_packed": 265.5,
+    "exp_up": 265.5,
+    "cache_evict": 270.5625
+   },
+   "counters_delta": {
+    "batch_submit_count": [
+     0,
+     0
+    ],
+    "batch_barrier_stats": [
+     0,
+     0
+    ],
+    "desc_cache_stats": [
+     947,
+     -2712,
+     947,
+     12970,
+     8006,
+     345
+    ],
+    "batch_upload_async_stats": [
+     0,
+     0
+    ],
+    "batch_deferred_stats": [
+     0,
+     0,
+     0,
+     0
+    ]
+   },
+   "resident_mib": 6299.619632720947,
+   "cache_hit": 11112,
+   "cache_miss": 4248,
+   "ids": [
+    6749,
+    506,
+    279,
+    21482,
+    13,
+    353,
+    3272,
+    883,
+    279,
+    1834,
+    13,
+    353,
+    3272,
+    883,
+    279,
+    1208
+   ],
+   "env": "cached=11797MiB mem_avail=9170MiB load=[4.19, 3.1, 2.83] rss_max=12712MiB",
+   "rss_mb": 12712.4453125,
+   "gpu_router": false,
+   "exp_cache_budget_mib": 2048.0,
+   "report_stats": "exp_down: total=0.771s calls=15360 avg=0.050ms\nexp_kernel: total=0.679s calls=15360 avg=0.044ms\nexp_packed: total=0.177s calls=4248 avg=0.042ms\nexp_up: total=0.402s calls=4248 avg=0.095ms\nexp_x: total=0.622s calls=15360 avg=0.040ms\npin_down: total=0.383s calls=5616 avg=0.068ms\npin_kernel: total=0.497s calls=5616 avg=0.088ms\npin_up: total=0.371s calls=5616 avg=0.066ms"
+  },
+  {
+   "label": "sequential",
+   "batched": false,
+   "tokens": 16,
+   "prefill_s": 2.506746393999947,
+   "s_per_tok": 0.28518106950002675,
+   "tok_per_s": 3.50654411161715,
+   "per_token_ms": [
+    287.8203670002222,
+    283.80456700006107,
+    310.2627359999133,
+    313.1353839999065,
+    298.02103700012594,
+    296.8333450003229,
+    288.66714700006924,
+    267.77209500005483,
+    273.70959099971515,
+    285.2140340000915,
+    236.2823789999311,
+    257.66681699997207,
+    284.7122000002855,
+    266.56186399986836,
+    301.17862099996273,
+    307.9541369997969
+   ],
+   "per_token_ms_median": 286.51720050015683,
+   "buckets_ms": {
+    "host_embed": 0.11869293740573994,
+    "host_rms": 2.35884068686687,
+    "sync": 213.8498476844859,
+    "host_glue": 4.8458353737999005,
+    "host_gdn": 14.828007812099031,
+    "host_fetch": 18.54939006207701,
+    "host_moe": 26.493028567387,
+    "host_attn": 3.187858125755838
+   },
+   "buckets_ms_total": {
+    "host_embed": 0.00011869293740573994,
+    "host_rms": 0.00235884068686687,
+    "sync": 0.2138498476844859,
+    "host_glue": 0.0048458353737999005,
+    "host_gdn": 0.014828007812099031,
+    "host_fetch": 0.01854939006207701,
+    "host_moe": 0.026493028567387,
+    "host_attn": 0.003187858125755838
+   },
+   "calls_per_tok": {
+    "host_embed": 1.0,
+    "host_rms": 81.0,
+    "sync": 4198.5,
+    "host_glue": 351.0,
+    "host_gdn": 30.0,
+    "host_fetch": 960.0,
+    "host_moe": 40.0,
+    "host_attn": 10.0
+   },
+   "samples_ms": {
+    "sync": {
+     "n": 67176,
+     "mean": 0.05093482140871404,
+     "median": 0.03755100033231429,
+     "p90": 0.07703099981881678,
+     "max": 3.135960000236082
+    }
+   },
+   "remainder_ms": 0.9495682501494684,
+   "bytes_up_mib": 171.921875,
+   "bytes_down_mib": 7.243804931640625,
+   "submits": 0.0,
+   "sync_roundtrips": 4198.5,
+   "fence_ms_total": 0.0,
+   "derived": {
+    "empty_submit_ms": 0.0460108399965975,
+    "transfer_est_ms": 35.2940798540535,
+    "fixed_submit_est_ms": 193.1765117257146,
+    "kernel_est_ms": 178.5557678304324,
+    "h2d_gbs": 13.12629054888243,
+    "d2h_gbs": 0.35229882639496907
+   },
+   "engine_stats": {
+    "pin_up": 0.02133711581146258,
+    "pin_kernel": 0.030340994312780367,
+    "pin_down": 0.024521529187467195,
+    "exp_x": 0.038179955311193225,
+    "exp_kernel": 0.042402430063731344,
+    "exp_down": 0.04768922294053368,
+    "exp_packed": 0.01094151956331757,
+    "exp_up": 0.02475019831206282
+   },
+   "engine_stat_calls": {
+    "pin_up": 351.0,
+    "pin_kernel": 351.0,
+    "pin_down": 351.0,
+    "exp_x": 960.0,
+    "cache_hit": 694.5,
+    "exp_kernel": 960.0,
+    "exp_down": 960.0,
+    "cache_miss": 265.5,
+    "exp_packed": 265.5,
+    "exp_up": 265.5,
+    "cache_evict": 270.5625
+   },
+   "counters_delta": {
+    "batch_submit_count": [
+     0,
+     0
+    ],
+    "batch_barrier_stats": [
+     0,
+     0
+    ],
+    "desc_cache_stats": [
+     947,
+     1384,
+     947,
+     12970,
+     8006,
+     345
+    ],
+    "batch_upload_async_stats": [
+     0,
+     0
+    ],
+    "batch_deferred_stats": [
+     0,
+     0,
+     0,
+     0
+    ]
+   },
+   "resident_mib": 6299.619632720947,
+   "cache_hit": 11112,
+   "cache_miss": 4248,
+   "ids": [
+    6749,
+    506,
+    279,
+    21482,
+    13,
+    353,
+    3272,
+    883,
+    279,
+    1834,
+    13,
+    353,
+    3272,
+    883,
+    279,
+    1208
+   ],
+   "env": "cached=11873MiB mem_avail=8931MiB load=[5.08, 3.32, 2.91] rss_max=12712MiB",
+   "rss_mb": 12712.4453125,
+   "gpu_router": false,
+   "exp_cache_budget_mib": 2048.0,
+   "report_stats": "exp_down: total=0.763s calls=15360 avg=0.050ms\nexp_kernel: total=0.678s calls=15360 avg=0.044ms\nexp_packed: total=0.175s calls=4248 avg=0.041ms\nexp_up: total=0.396s calls=4248 avg=0.093ms\nexp_x: total=0.611s calls=15360 avg=0.040ms\npin_down: total=0.392s calls=5616 avg=0.070ms\npin_kernel: total=0.485s calls=5616 avg=0.086ms\npin_up: total=0.341s calls=5616 avg=0.061ms"
+  }
+ ],
+ "median_run": {
+  "label": "sequential",
+  "batched": false,
+  "tokens": 16,
+  "prefill_s": 2.4214246249998723,
+  "s_per_tok": 0.28948151087502083,
+  "tok_per_s": 3.45445205456225,
+  "per_token_ms": [
+   294.8432360003608,
+   318.51269600019805,
+   317.2865650003587,
+   309.34120700021595,
+   307.51750099989295,
+   301.3456919998134,
+   284.14985500012335,
+   273.8217440000881,
+   277.2590289996515,
+   282.17546599989873,
+   243.7689829998817,
+   252.16339600001447,
+   261.8201599998429,
+   265.85455899976296,
+   298.48952500015,
+   340.098410000337
+  ],
+  "per_token_ms_median": 289.49654550024206,
+  "buckets_ms": {
+   "host_embed": 0.1147805624555076,
+   "host_rms": 2.3956681251036116,
+   "sync": 217.2101911853872,
+   "host_glue": 4.894173687603143,
+   "host_gdn": 15.29737181215296,
+   "host_fetch": 18.6909208136683,
+   "host_moe": 26.7596361886433,
+   "host_attn": 3.1711783121863846
+  },
+  "buckets_ms_total": {
+   "host_embed": 0.0001147805624555076,
+   "host_rms": 0.0023956681251036116,
+   "sync": 0.2172101911853872,
+   "host_glue": 0.004894173687603143,
+   "host_gdn": 0.01529737181215296,
+   "host_fetch": 0.0186909208136683,
+   "host_moe": 0.0267596361886433,
+   "host_attn": 0.0031711783121863846
+  },
+  "calls_per_tok": {
+   "host_embed": 1.0,
+   "host_rms": 81.0,
+   "sync": 4198.5,
+   "host_glue": 351.0,
+   "host_gdn": 30.0,
+   "host_fetch": 960.0,
+   "host_moe": 40.0,
+   "host_attn": 10.0
+  },
+  "samples_ms": {
+   "sync": {
+    "n": 67176,
+    "mean": 0.05173518904022561,
+    "median": 0.037569999676634325,
+    "p90": 0.07747100016786135,
+    "max": 3.175440999712009
+   }
+  },
+  "remainder_ms": 0.947590187820424,
+  "bytes_up_mib": 171.921875,
+  "bytes_down_mib": 7.243804931640625,
+  "submits": 0.0,
+  "sync_roundtrips": 4198.5,
+  "fence_ms_total": 0.0,
+  "derived": {
+   "empty_submit_ms": 0.0460108399965975,
+   "transfer_est_ms": 35.2940798540535,
+   "fixed_submit_est_ms": 193.1765117257146,
+   "kernel_est_ms": 181.9161113313337,
+   "h2d_gbs": 13.12629054888243,
+   "d2h_gbs": 0.35229882639496907
+  },
+  "engine_stats": {
+   "pin_up": 0.02320607993675594,
+   "pin_kernel": 0.031044864312121945,
+   "pin_down": 0.023912572438007373,
+   "exp_x": 0.03885006825126425,
+   "exp_kernel": 0.042449121188184336,
+   "exp_down": 0.04817813306272001,
+   "exp_packed": 0.011077474999268588,
+   "exp_up": 0.02511278162469921
+  },
+  "engine_stat_calls": {
+   "pin_up": 351.0,
+   "pin_kernel": 351.0,
+   "pin_down": 351.0,
+   "exp_x": 960.0,
+   "cache_hit": 694.5,
+   "exp_kernel": 960.0,
+   "exp_down": 960.0,
+   "cache_miss": 265.5,
+   "exp_packed": 265.5,
+   "exp_up": 265.5,
+   "cache_evict": 270.5625
+  },
+  "counters_delta": {
+   "batch_submit_count": [
+    0,
+    0
+   ],
+   "batch_barrier_stats": [
+    0,
+    0
+   ],
+   "desc_cache_stats": [
+    947,
+    -2712,
+    947,
+    12970,
+    8006,
+    345
+   ],
+   "batch_upload_async_stats": [
+    0,
+    0
+   ],
+   "batch_deferred_stats": [
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  "resident_mib": 6299.619632720947,
+  "cache_hit": 11112,
+  "cache_miss": 4248,
+  "ids": [
+   6749,
+   506,
+   279,
+   21482,
+   13,
+   353,
+   3272,
+   883,
+   279,
+   1834,
+   13,
+   353,
+   3272,
+   883,
+   279,
+   1208
+  ],
+  "env": "cached=11797MiB mem_avail=9170MiB load=[4.19, 3.1, 2.83] rss_max=12712MiB",
+  "rss_mb": 12712.4453125,
+  "gpu_router": false,
+  "exp_cache_budget_mib": 2048.0,
+  "report_stats": "exp_down: total=0.771s calls=15360 avg=0.050ms\nexp_kernel: total=0.679s calls=15360 avg=0.044ms\nexp_packed: total=0.177s calls=4248 avg=0.042ms\nexp_up: total=0.402s calls=4248 avg=0.095ms\nexp_x: total=0.622s calls=15360 avg=0.040ms\npin_down: total=0.383s calls=5616 avg=0.068ms\npin_kernel: total=0.497s calls=5616 avg=0.088ms\npin_up: total=0.371s calls=5616 avg=0.066ms"
+ },
+ "env_end": "cached=11873MiB mem_avail=8931MiB load=[5.08, 3.32, 2.91] rss_max=12712MiB"
+}
