@@ -103,7 +103,7 @@ def batch_moe_fused_record(h_x_fused: int, h_y_acc: int, h_sg: int, h_su: int, h
     ...
 
 
-def batch_moe_kquant_fused_record(h_x_fused: int, h_y_acc: int, h_sg: int, h_su: int, h_gsc: int, h_x3: int, h_sdown: int, qtype: str, h_silu_all: int, h_arena_wf: int, h_arena_wd: int, h_ids_gu: int, h_ids_dn: int, h_gs: int, gu_rows: int, gu_cols: int, rows_fused: int, dn_rows: int, dn_cols: int, rows_down: int, silu_N: int, sg_w: int, sg_rows: int, sg_cols: int, su_w: int, su_rows: int, su_cols: int, gsc_w: int, gsc_rows: int, gsc_cols: int, sdp_w: int, sdp_rows: int, sdp_cols: int, gate_rows: int, acc_out: torch.Tensor, sd_out: torch.Tensor, gsc_out: torch.Tensor) -> None:
+def batch_moe_kquant_fused_record(h_x_fused: int, h_y_acc: int, h_sg: int, h_su: int, h_gsc: int, h_x3: int, h_sdown: int, qtype: str, h_silu_all: int, h_arena_wf: int, h_arena_wd: int, h_ids_gu: int, h_ids_dn: int, h_gs: int, gu_rows: int, gu_cols: int, rows_fused: int, dn_rows: int, dn_cols: int, rows_down: int, silu_N: int, sg_w: int, sg_rows: int, sg_cols: int, su_w: int, su_rows: int, su_cols: int, gsc_w: int, gsc_rows: int, gsc_cols: int, sdp_w: int, sdp_rows: int, sdp_cols: int, gate_rows: int, acc_out: torch.Tensor, sd_out: torch.Tensor, gsc_out: torch.Tensor, gsc_fp32: bool = False) -> None:
     """K-quant fused MoE layer record: 1 fused 8-expert gateup+silu + 1 fused 8-expert down-accumulate over the packed arenas (Ids/Gs indexed) + shared gate/up/gsc + swiglu fold + shared down + 3 downloads in one call - drop-in for batch_moe_kquant_record followed by the caller's shared-expert tail (2 dispatches instead of 16 for the routed experts).
     """
     ...

@@ -2126,6 +2126,9 @@ static void batch_moe_kquant_record_vulkan(
 static void batch_bf16_io_vulkan(int64_t x_handle, int64_t h_w, int64_t h_b,
                                  int64_t y_handle, int64_t T, int64_t N,
                                  int64_t K, bool use_bias);
+static void batch_fp32_io_vulkan(int64_t x_handle, int64_t h_w, int64_t h_b,
+                                 int64_t y_handle, int64_t T, int64_t N,
+                                 int64_t K, bool use_bias);
 static void batch_swiglu_io_vulkan(int64_t h_gate, int64_t h_up,
                                    int64_t h_out, int64_t N);
 static void batch_download_vulkan(int64_t handle, torch::Tensor out,
@@ -2302,7 +2305,8 @@ static void batch_moe_kquant_fused_record_vulkan(
     int64_t gsc_w, int64_t gsc_rows, int64_t gsc_cols,
     int64_t sdp_w, int64_t sdp_rows, int64_t sdp_cols,
     int64_t gate_rows,
-    torch::Tensor acc_out, torch::Tensor sd_out, torch::Tensor gsc_out) {
+    torch::Tensor acc_out, torch::Tensor sd_out, torch::Tensor gsc_out,
+    bool gsc_fp32 = false) {
     TORCH_CHECK(g_batch.active,
                 "batch_moe_kquant_fused_record outside an open batch");
     batch_kquant_gateup8_io_vulkan(
@@ -2313,7 +2317,15 @@ static void batch_moe_kquant_fused_record_vulkan(
         dn_rows, dn_cols, rows_down, silu_N);
     batch_bf16_io_vulkan(h_x_fused, sg_w, sg_w, h_sg, 1, sg_rows, sg_cols, false);
     batch_bf16_io_vulkan(h_x_fused, su_w, su_w, h_su, 1, su_rows, su_cols, false);
-    batch_bf16_io_vulkan(h_x_fused, gsc_w, gsc_w, h_gsc, 1, gsc_rows, gsc_cols, false);
+    // The GGUF path pins shared_expert_gate as FP32 (a float32 GGUF norm
+    // tensor); reading those 4-byte elements through the bf16 shader
+    // reinterprets halves of the fp32 words and corrupts the gate scalar.
+    if (gsc_fp32) {
+        batch_fp32_io_vulkan(h_x_fused, gsc_w, gsc_w, h_gsc, 1, gsc_rows,
+                             gsc_cols, false);
+    } else {
+        batch_bf16_io_vulkan(h_x_fused, gsc_w, gsc_w, h_gsc, 1, gsc_rows, gsc_cols, false);
+    }
     batch_swiglu_io_vulkan(h_sg, h_su, h_x3, gate_rows);
     batch_bf16_io_vulkan(h_x3, sdp_w, sdp_w, h_sdown, 1, sdp_rows, sdp_cols, false);
     batch_download_vulkan(h_y_acc, acc_out, 0);
@@ -3608,7 +3620,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("gsc_w"), py::arg("gsc_rows"), py::arg("gsc_cols"),
           py::arg("sdp_w"), py::arg("sdp_rows"), py::arg("sdp_cols"),
           py::arg("gate_rows"),
-          py::arg("acc_out"), py::arg("sd_out"), py::arg("gsc_out"));
+          py::arg("acc_out"), py::arg("sd_out"), py::arg("gsc_out"),
+          py::arg("gsc_fp32") = false);
     m.def("batch_bf16_io", &batch_bf16_io_vulkan,
           "Record a BF16 dense matvec dispatch into the open batch.",
           py::arg("x_handle"), py::arg("h_w"), py::arg("h_b"),
