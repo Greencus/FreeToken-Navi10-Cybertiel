@@ -27,11 +27,13 @@ decode modes produce the same token ids on the greedy identity prompt (see
 | Piece | Where |
 | --- | --- |
 | 7 GLSL compute shaders | `python/freetoken/kernel/vulkan/shaders/linear_q{4k,5k}_*_f32.comp`, `linear_q8_0_resident_f32.comp` |
+| 4 fused 8-expert shaders | `linear_q{4k,5k}_{gateup8,acc8}_f32.comp` (see [Fused 8-expert dispatch](#fused-8-expert-dispatch-arena-slot-addressing)) |
 | Push constant + dispatch | `ext_module.cpp` (`struct KQuantPC`, `linear_kquant_resident_io`, `batch_kquant_io`, `batch_moe_kquant_record`) |
+| Fused bindings | `ext_module.cpp` (`KQuant8PC`/`KQuant8AccPC`, `linear_kquant_{gateup8,acc8}_io`, `batch_kquant_{gateup8,acc8}_io`, `batch_moe_kquant_fused_record`) |
 | Packed expert provider | `python/freetoken/models/gguf/packed.py` |
-| Gates | `tests/kernel/vulkan/test_kquant_shaders.py`, `tests/gguf_vulkan/test_gguf_packed.py` |
+| Gates | `tests/kernel/vulkan/test_kquant_shaders.py`, `tests/kernel/vulkan/test_kquant_fused.py`, `tests/gguf_vulkan/test_gguf_packed.py` |
 
-Shaders (52 `.comp` in total; compile with `python -m freetoken.kernel.vulkan.build`
+Shaders (56 `.comp` in total; compile with `python -m freetoken.kernel.vulkan.build`
 or `compile_shaders()`, output goes to `~/.cache/freetoken/vulkan/shaders`):
 
 | Shader | kind | writes |
@@ -41,6 +43,8 @@ or `compile_shaders()`, output goes to `~/.cache/freetoken/vulkan/shaders`):
 | `linear_q4k_acc_resident_f32.comp` | `acc` | `Y[T,N] += ...` (accumulate) |
 | `linear_q5k_*` (same three) | | Q5_K unpack, adds the `qh` bit matrix |
 | `linear_q8_0_resident_f32.comp` | `resident` | dense-tensor GEMV only |
+| `linear_q{4k,5k}_gateup8_f32.comp` | `gateup8` | 8 experts' `silu(gate)*up` in ONE dispatch, `Y[8*T,N]` slot `j` = expert `Ids[j]` |
+| `linear_q{4k,5k}_acc8_f32.comp` | `acc8` | 8 experts' down-accumulate in ONE dispatch, ordered `j=0..7` |
 
 There is deliberately no `gateup`/`acc` Q8_0 variant: in this file Q8_0
 covers dense tensors, not expert matrices, so the plain GEMV is all it needs.
@@ -313,29 +317,153 @@ At that rate the packed 13.5 MiB/token costs about 2.5 ms of upload against
 5.1 ms for 27 MiB of BF16 - and, unlike the host path, the unpack work is on
 the GPU and the CPU is free to run the rest of the step.
 
+## Fused 8-expert dispatch (arena slot addressing)
+
+The batched decode path pays **16 K-quant dispatches per layer** (8 gateup +
+8 acc) inside its 91 submits/token. The fused pair collapses each half to
+**ONE dispatch** - 16 -> 2 per layer - by taking the eight routed experts of a
+layer in a single grid, addressed through the engine's fixed-slot per-layer
+expert arena (28 slots/layer = 2047 MiB within the 2048 MiB cache budget,
+73.125 MiB per slot per layer).
+
+| Shader | grid | replaces |
+| --- | --- | --- |
+| `linear_q{4k,5k}_gateup8_f32.comp` | `(N, 8)` - WG `(n, j)` = expert `j`, gate row `n` | 8 x `linear_q{4k,5k}_gateup_silu_f32` |
+| `linear_q{4k,5k}_acc8_f32.comp` | `(N, 1)` - one 128-lane WG per output row, all 8 dots | 8 x `linear_q{4k,5k}_acc_resident_f32` |
+
+Five std430 bindings, same for both halves:
+
+```
+0  arena packed K-quant bytes (per-slot stride = rows_per_slot rows)
+1  X fp32 (gateup: the layer input; acc: the silu-all vector)
+2  Y fp32 (gateup: [8*N], expert j -> rows [j*N, (j+1)*N); acc: [N], RMW)
+3  Ids u32[8]  - expert j -> arena slot index
+4  Gs  f32[16] - gateup scale at Gs[j], acc scale at Gs[8+j]
+```
+
+Push constants: `KQuant8PC {T,N,K,wpr,ng32,rows_per_slot,rowstride}` (28 B)
+for gateup; `KQuant8AccPC` adds `silu_N` (32 B) for acc. Slot 0 is the
+engine's `0x7FFFFFFF` no-content sentinel - an out-of-slab row offset makes
+the packed fp16 scale halves decode to NaN, so the sentinel doubles as an
+in-bounds probe (Gate B asserts poisoned where hit, finite everywhere else).
+
+**Bit-identity is structural, not approximate.** `row_dot` in both fused
+shaders is the exact source of the per-expert shaders (same lane/word split,
+super-block indexing, `k4_sm` 6-bit extraction, FMA order, butterfly) - only
+address/value plumbing moves (`Ids[j]*rows_per_slot` for the row base,
+`Gs[j]` for gscale, a shared output slot for the write). The acc half is
+deliberately `(N, 1)` rather than `(N, 8)`: with eight workgroups sharing a
+row the 8 fp32 RMW adds would race, so each lane keeps 8 private
+accumulators, one tree reduce yields all `d_j`, and lane 0 sums them in
+canonical `j = 0..7` order into ONE add over a `+0.0`-prefilled `Y` - the
+same strictly-ordered chain as the 8 sequential dispatches.
+
+Bindings (90 total in the extension):
+
+| Binding | Kind |
+| --- | --- |
+| `linear_kquant_gateup8_io` / `linear_kquant_acc8_io` | sync, one submit each |
+| `batch_kquant_gateup8_io` / `batch_kquant_acc8_io` | inside an open batch |
+| `batch_moe_kquant_fused_record` | one pybind crossing for a whole layer: gateup8 + acc8 + the shared-expert tail (bf16 gate/up/gscale, `batch_swiglu`, down, both downloads) |
+
+Engine call site (pending the engine lane): swap `batch_moe_kquant_record`'s
+16 `batch_kquant_io` (`gguf_batched.py` `_record_moe_in`) for
+`batch_moe_kquant_fused_record` over the per-layer arenas - the expected
+saving is 14 dispatches' record+drain overhead per layer, which is what lets
+the token shrink to 1-2 command buffers and lets the verify row batch amortize
+its drain.
+
+Measured (`KFUSED_BENCH`, layer-0-sized real expert bytes, bit-exact vs the
+per-expert arms in both GEMVs):
+
+| Case | 16 dispatches (per-expert) | 2 dispatches (fused) |
+| --- | --- | --- |
+| wall, 8 experts gateup+acc | 0.1999-0.2277 ms | **0.1467-0.1719 ms** |
+| dispatch count | 16 | **2** |
+| quantized-weight bandwidth | - | **84.4-93.2 GB/s** |
+| H2D content bytes | 14,155,776 | **14,155,776 (equal - arena is contiguous)** |
+
+plus `arena_sentinel_overhead_bytes = 1,769,472` (1.77 MB of reserved
+slot-0 poison the engine uploads on top of the content bytes - the price of
+the sentinel).
+
+## BAR readback (GDN pull-down) fix
+
+`make_host_ssbo` asked only for `HOST_VISIBLE|HOST_COHERENT`, and RADV
+resolved the staging pool to the **uncached** host type (property bits
+`0x0006`, heap mapped into GTT) - every CPU read of a completed copy went
+through the uncached aperture at **~340 MB/s**. The GDN pull-down (30 states
+of 2 MB + 30 conv buffers of 96 KB = 60 readbacks, 62.8 MB) therefore cost
+**187.6 ms wall per snapshot** (fence 2.56-2.79 ms + ~185 ms memcpy) and a
+sync `download_resident` of the same bytes **204.7 ms**. The cached host type
+(`0x000e`) was present all along - a memory-type probe measured 4.5 GB/s with
+it, against 340 MB/s without.
+
+Fixes, both in `vk_util.hpp`:
+
+1. `make_host_ssbo` now prefers `HOST_VISIBLE|HOST_CACHED` and `make_buffer`
+   degrades by dropping `HOST_CACHED` only if no such type exists;
+   `FREETOKEN_VULKAN_LOG_MEMTYPE` prints the chosen type. Both candidate
+   types are HOST_COHERENT here, so the persistent-mapping flush/invalidate
+   contract documented above is untouched.
+2. `memcpy_bar` (used by `vku::download`, covering sync and batch readbacks)
+   takes a `movntdqa` non-temporal path for >= 1024 B with an
+   `__builtin_cpu_supports("sse4.1")` fallback to `std::memcpy`. This is
+   second-order next to (1): A/B on the snapshot arm gave std 5.80 / avx
+   5.24 / nt 4.95 / mt 9.44 ms - multithreaded was *worse* and was dropped.
+
+Uploads are unaffected (5.62 vs 5.61 ms for the same 62.8 MB, 11.2 GB/s).
+
+Measured back to back after the fix (4 runs of the snapshot arm, load avg
+4.56-4.99, `Cached` 15.8-16.5 GB, RSS 575 MB):
+
+| copy | before | after |
+| --- | --- | --- |
+| snapshot arm wall (fence + 60 readbacks) | 187.6 ms | **7.47-8.13 ms** |
+| readback bandwidth | 0.34 GB/s | **11.1-12.8 GB/s (33-38x)** |
+| sync `download_resident` 62.8 MB | 204.7 ms (0.31 GB/s) | **9.74-10.40 ms (6.0-6.4 GB/s)** |
+| DRAM->DRAM control, same bytes | ~6.7 ms (~9.4 GB/s) | same - the readback now sits at DRAM speed |
+
+Every arm asserted bit-exact against the pre-fix buffers. For MTP this
+retires the per-round `snapshot()`/`restore()` pull-down (was ~186 ms/round
+on the engine's 60-readback path) down to ~6 ms of memcpy.
+
 ## Gates
 
 ```bash
 cd FreeToken-Navi10-Cybertiel
 PYTHONPATH=python python -m pytest tests/kernel/vulkan -q                    # no checkpoint
 PYTHONPATH=python FREETOKEN_TEST_MODEL_GGUF=<path> \
+  python -m pytest tests/kernel/vulkan -q                                     # + real experts + fused/readback gates
+PYTHONPATH=python FREETOKEN_TEST_MODEL_GGUF=<path> \
   python -m pytest tests/kernel/vulkan/test_kquant_shaders.py -q             # + real expert
 PYTHONPATH=python FREETOKEN_TEST_MODEL_GGUF=<path> \
   python -m pytest tests/gguf_vulkan -q                                      # packed provider
 ```
 
-Measured on this box (interpreter `/home/cus/.venv-vllm-vulkan/bin/python`):
+Measured on this box (interpreter `/home/cus/.venv-vllm-vulkan/bin/python`,
+2026-10-21):
 
 | Command | Result |
 | --- | --- |
-| `pytest tests/kernel/vulkan -q` (no checkpoint) | **29 passed, 1 skipped** in 4.06 s |
+| `pytest tests/kernel/vulkan -q` (no checkpoint) | **40 passed, 2 skipped** |
+| `FREETOKEN_TEST_MODEL_GGUF=<path> pytest tests/kernel/vulkan -q` | **42 passed** in 32.46 s |
 | `FREETOKEN_TEST_MODEL_GGUF=<path> pytest tests/kernel/vulkan/test_kquant_shaders.py -q` | **24 passed** in 12.61 s (adds the real `blk.0` expert) |
 | `FREETOKEN_TEST_MODEL_GGUF=<path> pytest tests/gguf_vulkan -q` | **45 passed, 1 skipped** in 18.87 s |
 | `pytest tests/gguf_vulkan -q` (no checkpoint) | 18 passed, 28 skipped |
+
+The fused pair has its own gates in `tests/kernel/vulkan/test_kquant_fused.py`
+(9 tests: fused-vs-per-expert sync bit-exact on real Q4_K/Q5_K bytes + numpy
+sanity, shuffled-arena + sentinel edge probes, the batch pair,
+`batch_moe_kquant_fused_record` vs a manual 16-dispatch + shared-tail
+reference with a byte-identical shared down, and the bench), and
+`tests/kernel/vulkan/test_bar_readback.py` checks the readback fix (snapshot
+round trip bit-exact + a >= 1000 MB/s floor against the measured 11-12
+GB/s).
 
 Every GPU test skips when no Vulkan device is present. Regenerate the binding
 stubs after touching `ext_module.cpp`:
 
 ```bash
-PYTHONPATH=python python -m freetoken.kernel.vulkan._gen_stub   # 82 functions
+PYTHONPATH=python python -m freetoken.kernel.vulkan._gen_stub   # 90 functions
 ```
