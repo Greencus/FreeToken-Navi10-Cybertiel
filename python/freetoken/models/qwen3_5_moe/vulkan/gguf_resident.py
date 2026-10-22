@@ -130,6 +130,12 @@ class ResidentGGUF(GgufBatchedMixin, ResidentNVFP4):
                 os.environ.pop("FTV_EXP_CACHE_MB", None)
             else:
                 os.environ["FTV_EXP_CACHE_MB"] = saved_cache
+        # After the base init AND the env restore: the K-quant arena reads
+        # only its own FTV_GGUF_* knobs (never the forced-off FTV_EXP_ARENA),
+        # probes the now-pinned banks for eligibility, and registers per-layer
+        # facts. Allocation itself stays lazy (first decode token) so prefill
+        # keeps the full VRAM budget for the resident LRU.
+        self._kq_arena_setup()
 
     # -- weight source ----------------------------------------------------
     def _open(self, model_dir):

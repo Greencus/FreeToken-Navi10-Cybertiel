@@ -16,12 +16,21 @@ through this mixin (first in the MRO):
   so one decode token drops from ~960 sync upload/kernel/download round
   trips to ~2-4 command buffer submits per layer.
 
+On top of that, ``GgufArenaMixin`` (the class's first base, see
+``gguf_arena.py``) swaps the per-expert resident-LRU record for the
+fixed-slot K-quant arena + fused crossing: ``_record_moe_in`` below opens
+with the arena gate and routes eligible layers to ``_kq_record_moe``, so
+this mixin's record body only runs for ineligible/MTP layers (and for
+``FTV_GGUF_ARENA=0``).
+
 Contract (enforced loudly, never silently degraded): packed lane on
-(``FTV_GGUF_PACKED=1``), resident cache budget > 0, arena/spec pack off
-(forced during ``ResidentGGUF.__init__``), GPU router off (falls out of
-the arena being off).  Env ``FTV_GGUF_BATCHED=0`` disables the whole path;
-``generate(batched=True)`` then downgrades to the sequential decoder with
-a printed warning so the correctness gates pass in either mode.
+(``FTV_GGUF_PACKED=1``), resident cache budget > 0, NVFP4 spec pack off
+(forced during ``ResidentGGUF.__init__``), NVFP4 GPU router off (falls out
+of ``FTV_EXP_ARENA`` being forced off; the GGUF arena has its own
+``FTV_GGUF_GPU_ROUTER`` knob).  Env ``FTV_GGUF_BATCHED=0`` disables the
+whole path; ``generate(batched=True)`` then downgrades to the sequential
+decoder with a printed warning so the correctness gates pass in either
+mode.
 """
 from __future__ import annotations
 
@@ -33,11 +42,12 @@ import torch.nn.functional as F
 
 from freetoken.models.gguf.packed import packed_gate_up_expert, packed_tensor
 
+from .gguf_arena import GgufArenaMixin
 from .gguf_provider import ExpertBank
 from .nvfp4_resident import _translate
 
 
-class GgufBatchedMixin:
+class GgufBatchedMixin(GgufArenaMixin):
     """K-quant record overrides for ``ResidentNVFP4.decode_step_batched``.
 
     Only the three per-layer record hooks are replaced; the batch walk,
@@ -156,6 +166,13 @@ class GgufBatchedMixin:
                 "(FTV_EXP_CACHE_MB>0): expert handles must stay alive "
                 "across the open batch"
             )
+        if self._kq_arena and self._kq_layer_ok.get(i, False):
+            # Fixed-slot K-quant arena (docs/vulkan/gpu-resident-token.md):
+            # one fused crossing over arena slots, experts not in the
+            # resident LRU at all. Ineligible layers, the MTP block-40
+            # walk and FTV_GGUF_ARENA=0 fall through to the LRU record
+            # below unchanged.
+            return self._kq_record_moe(i, h, ext)
         gate_mat = self.expert_mats[f"{base}.mlp.switch_mlp.gate_proj"]
         up_mat = self.expert_mats[f"{base}.mlp.switch_mlp.up_proj"]
         down_mat = self.expert_mats[f"{base}.mlp.switch_mlp.down_proj"]

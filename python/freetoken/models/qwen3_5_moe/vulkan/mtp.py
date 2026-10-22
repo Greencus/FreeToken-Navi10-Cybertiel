@@ -214,12 +214,20 @@ class MtpHead:
         self.shared_head_norm = _nextn_norm(tensors, "shared_head_norm")
 
         # Routed experts of the MTP block join the decoder's VRAM LRU through
-        # the same ExpertBank contract. The stem registry (_mat_stems /
-        # _mat_layer) stays untouched: it feeds the arena and hotset paths,
-        # both of which are NVFP4-pack only and off for GGUF.
+        # the same ExpertBank contract. With the GGUF K-quant arena on
+        # (_kq_arena), also register layer 40 in _mat_layer: the base
+        # helpers that resolve a bank to its layer (_fused_slot0,
+        # _down_slot0, hotset walk) must see 40, not None. The registry
+        # stays inert on this path (_arena_enabled is forced off for GGUF
+        # and _arena_keys is empty), but an accidental lookup has to
+        # answer with the right layer instead of silently taking the
+        # "legacy path reads rows [0, N)" fallback.
         for proj in ("gate", "up", "down"):
             stem = f"{stem_base}.mlp.switch_mlp.{proj}_proj"
-            model.expert_mats[stem] = tensors.expert_bank(MTP_LAYER, proj)
+            bank = tensors.expert_bank(MTP_LAYER, proj)
+            model.expert_mats[stem] = bank
+            if getattr(model, "_kq_arena", False):
+                model._mat_layer[id(bank)] = MTP_LAYER
 
         # The MTP block's own KV cache, same layout/dtype as the trunk's.
         kv_torch_dtype = (

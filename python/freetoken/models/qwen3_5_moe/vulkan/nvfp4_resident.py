@@ -2720,6 +2720,14 @@ class ResidentNVFP4(ResidentQwen35):
                 # cookie via batch_submit([cookie]) after recording
                 # batch_cross_barrier at batch_begin (visibility).
                 _async_cookie = self._gpu_router_prewarm_async_uploads(i)
+            elif getattr(self, "_kq_prefetch_on", False):
+                # GGUF arena host lane (FTV_GGUF_PREFETCH=1): route THIS
+                # layer on the host, pin its routed experts into arena
+                # slots and flush any content misses as queue-2 copies -
+                # all before batch_begin, so the DMA overlaps the host
+                # record window and batch_submit below waits on the cookie.
+                # getattr: this knob exists only on ResidentGGUF.
+                _async_cookie = self._kq_prefetch_layer(i, h2)
             ext.batch_begin()
             if _async_cookie >= 0:
                 # Queue-2 -> main-queue memory barrier (task #29): the
@@ -2857,7 +2865,11 @@ class ResidentNVFP4(ResidentQwen35):
                     self.h_x_fused, h2.contiguous().float())
                 ext.batch_fill(self.h_y_acc, 0.0, cfg.hidden_size)
                 acc_t, sd_t, gsc_t = self._record_moe_in(i, h2, ext)
-                ext.batch_submit()
+                # _async_cookie is -1 unless the GGUF arena's host-lane
+                # prefetch above queued queue-2 content for this layer;
+                # the semaphore ordering matches the GPU-router branch's.
+                ext.batch_submit(
+                    [_async_cookie] if _async_cookie >= 0 else [])
             if spec_on:
                 # Half-B skip rule: a layer only speculates for the NEXT
                 # token when THIS token actually missed (pack work
