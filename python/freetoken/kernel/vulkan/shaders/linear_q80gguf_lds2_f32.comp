@@ -1,0 +1,127 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Q8_0 GEMV over the GGUF file's OWN packed bytes (FTV_DENSE_Q80),
+// vectorized uvec2 staging (FTV_Q80_GGUF_VARIANT=lds2).  Same ping-pong
+// segment staging as linear_q80gguf_lds, but the global side fetches the
+// segment as 8-byte uvec2s through binding 4 (the same VkBuffer bound
+// twice: binding 0 stays the dword/byte view for the fallback path).
+// Vector staging is taken only when its uvec2 tail ends inside the row;
+// otherwise the segment falls back to the ref-faithful dword staging.
+// Extraction never straddles a 4-byte word (block starts are 0 or 2 mod 4)
+// and only bytes with W = s0off + j < s0off + nbytes are read, so the
+// first uvec2's reach into the previous row's tail is never used.
+// fma order, to_bf16 RNE and the tree reduce are identical to ref ->
+// bit-identical outputs.
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer QBuf { uint Q[]; };
+layout(std430,binding=1) readonly buffer BBuf { uint16_t B[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) writeonly buffer YBuf { float Y[]; };
+layout(std430,binding=4) readonly buffer QVBuf { uvec2 QV[]; };
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint use_bias; uint rowstride;
+} p;
+shared float sums[128];
+shared uvec2 seg2[2][18];   // uvec2 staging: <= 18 * 8 B per segment
+shared uint seg[2][35];     // dword fallback: same layout as linear_q80gguf_lds
+
+float bf16(uint bits) { return uintBitsToFloat(bits << 16u); }
+
+// Round f32 -> bf16, round-to-nearest-even (same as torch.bfloat16()).
+float to_bf16(float v) {
+  uint f = floatBitsToUint(v);
+  f = f + 0x7FFFu + ((f >> 16u) & 1u);   // RNE: half-ulp bias + lsb
+  return uintBitsToFloat(f & 0xFFFF0000u);
+}
+
+void main() {
+  uint n = gl_WorkGroupID.x, t = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+  if (n >= p.N || t >= p.T) return;
+  float acc = 0.0;
+  uint wb = n * p.rowstride, xo = t * p.K;
+  uint blocks = p.K >> 5u;
+  uint iters = (blocks + 3u) >> 2u;
+  // Loop-carried per-segment flags (uniform: computed from n/m only).
+  uint s0off = 0u;
+  bool u2ok = false;
+  // Pre-stage segment 0.
+  {
+    uint seg0 = wb;
+    uint nbytes = 34u * min(4u, blocks);
+    uint ab = seg0 & ~7u;
+    s0off = seg0 - ab;
+    uint nv = (s0off + nbytes + 7u) / 8u;
+    u2ok = (ab + 8u * nv) <= (wb + p.rowstride);
+    if (u2ok) {
+      for (uint i = tid; i < nv; i += 128u)
+        seg2[0][i] = QV[(ab >> 3u) + i];
+    } else {
+      uint base = seg0 & ~3u;
+      uint o = seg0 - base;
+      uint nd = (o + nbytes + 3u) / 4u;
+      for (uint i = tid; i < nd; i += 128u)
+        seg[0][i] = Q[(base >> 2u) + i];
+    }
+  }
+  barrier();
+  for (uint m = 0u; m < iters; ++m) {
+    uint k = tid + (m << 7u);
+    uint seg0 = wb + (m << 7u) + (m << 3u);          // wb + 136m
+    if (k < p.K) {
+      uint si = m & 1u;
+      uint jd = (tid >> 5u) * 34u;                   // block start in segment
+      uint q8, wd;
+      if (u2ok) {
+        uint W = s0off + jd + 2u + (tid & 31u);      // code byte
+        uvec2 v = seg2[si][W >> 3u];
+        uint word = (W & 4u) != 0u ? v.y : v.x;
+        q8 = (word >> ((W & 3u) * 8u)) & 0xFFu;
+        uint Wd = s0off + jd;                        // block scale (word-aligned)
+        uvec2 vd = seg2[si][Wd >> 3u];
+        uint wordd = (Wd & 4u) != 0u ? vd.y : vd.x;
+        wd = (wordd >> ((Wd & 3u) * 8u)) & 0xFFFFu;
+      } else {
+        uint o = seg0 & 3u;
+        uint gd = o + jd;
+        wd = (seg[si][gd >> 2u] >> ((gd & 3u) * 8u)) & 0xFFFFu;
+        uint gq = gd + 2u + (tid & 31u);
+        q8 = (seg[si][gq >> 2u] >> ((gq & 3u) * 8u)) & 0xFFu;
+      }
+      float d = float(unpackHalf2x16(wd).x);
+      int q = q8 >= 0x80u ? int(q8) - 256 : int(q8);  // sign-extend int8
+      acc = fma(X[xo + k], to_bf16(float(q) * d), acc);
+    }
+    if (m + 1u < iters) {
+      uint sn = m + 1u;
+      uint seg1 = wb + (sn << 7u) + (sn << 3u);
+      uint nbytes = 34u * min(4u, blocks - (sn << 2u));
+      uint ab = seg1 & ~7u;
+      uint off1 = seg1 - ab;
+      uint nv = (off1 + nbytes + 7u) / 8u;
+      bool ok = (ab + 8u * nv) <= (wb + p.rowstride);
+      if (ok) {
+        for (uint i = tid; i < nv; i += 128u)
+          seg2[sn & 1u][i] = QV[(ab >> 3u) + i];
+      } else {
+        uint base = seg1 & ~3u;
+        uint o = seg1 - base;
+        uint nd = (o + nbytes + 3u) / 4u;
+        for (uint i = tid; i < nd; i += 128u)
+          seg[sn & 1u][i] = Q[(base >> 2u) + i];
+      }
+      barrier();
+      u2ok = ok;
+      s0off = off1;
+    }
+  }
+  sums[tid] = acc;
+  barrier();
+  for (uint s = 64u; s > 0u; s >>= 1u) {
+    if (tid < s) sums[tid] += sums[tid + s];
+    barrier();
+  }
+  if (tid == 0u)
+    Y[t * p.N + n] = sums[0] + (p.use_bias != 0u ? bf16(uint(B[n])) : 0.0);
+}

@@ -1,0 +1,69 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+// Q8_0 GEMV over the GGUF file's OWN packed bytes (FTV_Q80_GGUF_VARIANT=
+// w64): 64-lane workgroup, each lane computes TWO reference streams -
+// accA = thread tid's partial sum (k = tid + 128m), accB = thread
+// tid+64's (k = tid + 64 + 128m) - interleaved in one loop so both
+// streams' loads are in flight together (2 code + 2 scale dword loads per
+// iteration, no subgroup ops in the loop).  The reduce needs NO barrier
+// and NO LDS: the baseline's first level (sums[t] += sums[t+64]) merges
+// exactly the two streams held by the SAME lane, and the remaining levels
+// are a 64-wide XOR butterfly, so lane 0's accumulation order - and
+// therefore every output bit - matches ref.  2-load fetch (dl and dh of
+// ref always address the same dword).
+layout(local_size_x=64) in;
+layout(std430,binding=0) readonly buffer QBuf { uint Q[]; };
+layout(std430,binding=1) readonly buffer BBuf { uint16_t B[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) writeonly buffer YBuf { float Y[]; };
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint use_bias; uint rowstride;
+} p;
+
+float bf16(uint bits) { return uintBitsToFloat(bits << 16u); }
+
+// Round f32 -> bf16, round-to-nearest-even (same as torch.bfloat16()).
+float to_bf16(float v) {
+  uint f = floatBitsToUint(v);
+  f = f + 0x7FFFu + ((f >> 16u) & 1u);   // RNE: half-ulp bias + lsb
+  return uintBitsToFloat(f & 0xFFFF0000u);
+}
+
+void main() {
+  uint n = gl_WorkGroupID.x, t = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+  if (n >= p.N || t >= p.T) return;
+  float accA = 0.0, accB = 0.0;
+  uint wb = n * p.rowstride, xo = t * p.K;
+  for (uint m = 0u; (m << 7u) < p.K; ++m) {
+    uint ka = tid + (m << 7u);
+    if (ka < p.K) {
+      uint bs = wb + (ka >> 5u) * 34u;
+      uint wd = (Q[bs >> 2u] >> ((bs & 3u) * 8u)) & 0xFFFFu;
+      uint ca = bs + 2u + (ka & 31u);
+      uint q8 = (Q[ca >> 2u] >> ((ca & 3u) * 8u)) & 0xFFu;
+      float d = float(unpackHalf2x16(wd).x);
+      int q = q8 >= 0x80u ? int(q8) - 256 : int(q8);
+      accA = fma(X[xo + ka], to_bf16(float(q) * d), accA);
+    }
+    uint kb = ka + 64u;
+    if (kb < p.K) {
+      uint bs = wb + (kb >> 5u) * 34u;
+      uint wd = (Q[bs >> 2u] >> ((bs & 3u) * 8u)) & 0xFFFFu;
+      uint ca = bs + 2u + (kb & 31u);
+      uint q8 = (Q[ca >> 2u] >> ((ca & 3u) * 8u)) & 0xFFu;
+      float d = float(unpackHalf2x16(wd).x);
+      int q = q8 >= 0x80u ? int(q8) - 256 : int(q8);
+      accB = fma(X[xo + kb], to_bf16(float(q) * d), accB);
+    }
+  }
+  // Baseline level s=64 (sums[t] += sums[t+64]) is stream A += stream B
+  // in this lane; levels s=32..1 are the 64-wide XOR butterfly.
+  float acc = accA + accB;
+  for (uint s = 32u; s > 0u; s >>= 1u)
+    acc += subgroupShuffleXor(acc, s);
+  if (tid == 0u)
+    Y[t * p.N + n] = acc + (p.use_bias != 0u ? bf16(uint(B[n])) : 0.0);
+}

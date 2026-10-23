@@ -441,6 +441,25 @@ class ResidentNVFP4(ResidentQwen35):
             self._gpu_router_check = False
         if self._gpu_router and not self._arena_enabled:
             self._gpu_router = False
+        # FTV_GPU_RMS=1: the decode walk's INPUT + FINAL RMSNorm run as the
+        # rmsnorm_1pw shader (x is uploaded, h never materialises on the
+        # host).  Post-attention h2 stays host-side on purpose: the MoE lane
+        # consumes it (host router input, or the GPU-router lane's shadow
+        # topk for arena prewarm), so removing it there is impossible.
+        try:
+            self._gpu_rms = int(os.environ.get("FTV_GPU_RMS", "0")) != 0
+        except (TypeError, ValueError):
+            self._gpu_rms = False
+        # Per-layer input_layernorm weights; the final model.norm weight is
+        # the last entry (walk indexes [i] per layer, [-1] for the final).
+        self._in_w_res: list[int] = []
+        if self._gpu_rms:
+            for _i in range(len(cfg.layer_types)):
+                _b = f"language_model.model.layers.{_i}"
+                self._in_w_res.append(ext.upload_resident(
+                    self._dense(f"{_b}.input_layernorm.weight").contiguous()))
+            self._in_w_res.append(ext.upload_resident(
+                self._dense("language_model.model.norm.weight").contiguous()))
         self._gpu_router_vram = 0
         self._router_w_res: list[int] = []     # per layer: fp32 [E, H]
         self._norm_w_res: list[int] = []       # per layer: fp32 [H]
@@ -2589,16 +2608,22 @@ class ResidentNVFP4(ResidentQwen35):
             if _stop is not None and i >= _stop and _stop >= 0:
                 break
             base = f"language_model.model.layers.{i}"
-            h = self._rms(
-                x, self._dense(f"{base}.input_layernorm.weight"),
-                cfg.rms_norm_eps,
-            )
+            spec_on = self._spec_buf is not None
+            # FTV_GPU_RMS: skip the host input norm - batch A / batch 1 run
+            # rmsnorm_1pw over the uploaded x instead.  The spec lookahead
+            # still needs h on the host (it runs the router from it), so that
+            # arm keeps the torch path.
+            h = None
+            if spec_on or not self._gpu_rms:
+                h = self._rms(
+                    x, self._dense(f"{base}.input_layernorm.weight"),
+                    cfg.rms_norm_eps,
+                )
             # Speculative pre-pack (b', within-token): the pre-attention
             # input h(L,T) is available here, BEFORE the layer's attention
             # batch. The lookahead enqueues CPU pack cells now; the worker
             # packs during batchA/batch1 + host work + batch2, and the
             # pre-batch3 drain of this SAME layer consumes them.
-            spec_on = self._spec_buf is not None
             if spec_on:
                 self._spec_lookahead(i, h)
             # --- batch A: merged linear-attention block (task #13) ----
@@ -2608,11 +2633,20 @@ class ResidentNVFP4(ResidentQwen35):
             # stay on host).
             if layer_type == "linear_attention":
                 ext.batch_begin()
-                ext.batch_upload_multi(
-                    [self.h_x_fused, self.h_x_resid],
-                    [h.contiguous().float(), x.contiguous().float()],
-                    [0, 0],
-                )
+                if h is None:
+                    # Input norm on device: x -> h_x_resid (still the
+                    # residual the vecadd below reads), normed into
+                    # h_x_fused for the in-projs.
+                    ext.batch_upload(self.h_x_resid, x.contiguous().float())
+                    ext.batch_rms1p_io(
+                        self.h_x_resid, self._in_w_res[i], self.h_x_fused,
+                        cfg.hidden_size, cfg.rms_norm_eps, 1)
+                else:
+                    ext.batch_upload_multi(
+                        [self.h_x_fused, self.h_x_resid],
+                        [h.contiguous().float(), x.contiguous().float()],
+                        [0, 0],
+                    )
                 import time as _time
                 t0 = _time.perf_counter()
                 self._record_gdn_in(i, ext, download=False)
@@ -2659,32 +2693,84 @@ class ResidentNVFP4(ResidentQwen35):
             else:
                 # --- batch 1: attention input side (dense in-projs) ---
                 ext.batch_begin()
-                ext.batch_upload(self.h_x_fused, h.contiguous().float())
+                if h is None:
+                    # Input norm on device; h_x_resid is scratch in this
+                    # branch (the residual add happens on the host below).
+                    ext.batch_upload(self.h_x_resid, x.contiguous().float())
+                    ext.batch_rms1p_io(
+                        self.h_x_resid, self._in_w_res[i], self.h_x_fused,
+                        cfg.hidden_size, cfg.rms_norm_eps, 1)
+                else:
+                    ext.batch_upload(self.h_x_fused, h.contiguous().float())
                 import time as _time
                 t0 = _time.perf_counter()
-                # Defaults keep the type checker happy; only the taken
-                # branch's tensors are actually read below.
-                qg_t = k_t = v_t = torch.empty(0)
-                qg_t, k_t, v_t = self._record_attn_in(i, ext)
-                self._bump("batchA_record", _time.perf_counter() - t0)
-                ext.batch_submit()
+                if getattr(self, "_gpu_attn", False):
+                    # GPU attention lane (FTV_GGUF_GPU_ATTN): q/k/v stay on
+                    # the GPU, then prep (per-head zero-centered RMS +
+                    # partial RoPE + KV append to the device cache) and the
+                    # single-query GQA forward run in the SAME batch, and
+                    # o_proj consumes the GPU context straight out of
+                    # h_x2 - the host readback, the host recurrence and the
+                    # whole of batch 2 disappear (full-attn drains 3 -> 2).
+                    a = self.config
+                    hd = a.head_dim
+                    hq = a.num_attention_heads
+                    hkv = a.num_key_value_heads
+                    self._record_attn_in(i, ext, download=False)
+                    self._attn_gpu_ensure(i, pos, ext)
+                    ext.batch_attn_prep_qwen35_io(
+                        self.h_qg, self.h_k, self.h_v,
+                        self._attn_dev_k[i], self._attn_dev_v[i],
+                        self._attn_stage[i], self.h_rope_cos,
+                        self.h_rope_sin, self._attn_qkn[i],
+                        pos, self.max_len, hq, hkv, hd,
+                        self.rotary_dim, a.rms_norm_eps)
+                    ext.batch_attn_fwd_qwen35_io(
+                        self.h_qg, self._attn_dev_k[i], self._attn_dev_v[i],
+                        self.h_x2, pos, self.max_len, hq, hkv, hd,
+                        1.0 / math.sqrt(hd))
+                    out_stem = f"{base}.self_attn.o_proj"
+                    opt = self.pinned[_translate(out_stem)]
+                    ext.batch_bf16_io(
+                        self.h_x2, opt.handle, opt.handle, self.h_ao,
+                        1, opt.rows, opt.cols, False,
+                    )
+                    ao_t = torch.empty(opt.rows)
+                    ext.batch_download(self.h_ao, ao_t)
+                    kv_t = torch.empty(2 * hkv * hd)
+                    ext.batch_download(self._attn_stage[i], kv_t)
+                    self._bump("batchA_record", _time.perf_counter() - t0)
+                    ext.batch_submit()
+                    # Host mirror writeback: the device cache already holds
+                    # this row; the host stays the source of truth for any
+                    # later prefix re-upload (reset/prefill/restore).
+                    self.k_cache[i][pos] = kv_t[:hkv * hd].view(hkv, hd)
+                    self.v_cache[i][pos] = kv_t[hkv * hd:].view(hkv, hd)
+                    self._attn_dev_len[i] = pos + 1
+                else:
+                    # Defaults keep the type checker happy; only the taken
+                    # branch's tensors are actually read below.
+                    qg_t = k_t = v_t = torch.empty(0)
+                    qg_t, k_t, v_t = self._record_attn_in(i, ext)
+                    self._bump("batchA_record", _time.perf_counter() - t0)
+                    ext.batch_submit()
 
-                # --- host: attention recurrence (needs the in-proj
-                # downloads; ``pre_out`` is the PRE-out_proj vector) ---
-                pre_out = self._full_attn_host(i, pos, qg_t, k_t, v_t)
+                    # --- host: attention recurrence (needs the in-proj
+                    # downloads; ``pre_out`` is the PRE-out_proj vector) ---
+                    pre_out = self._full_attn_host(i, pos, qg_t, k_t, v_t)
 
-                # --- batch 2: attention out_proj, residual add, h2 ----
-                ext.batch_begin()
-                out_stem = f"{base}.self_attn.o_proj"
-                opt = self.pinned[_translate(out_stem)]
-                ext.batch_upload(self.h_x2, pre_out.contiguous().float())
-                ao_t = torch.empty(opt.rows)
-                ext.batch_bf16_io(
-                    self.h_x2, opt.handle, opt.handle, self.h_ao,
-                    1, opt.rows, opt.cols, False,
-                )
-                ext.batch_download(self.h_ao, ao_t)
-                ext.batch_submit()
+                    # --- batch 2: attention out_proj, residual add, h2 ----
+                    ext.batch_begin()
+                    out_stem = f"{base}.self_attn.o_proj"
+                    opt = self.pinned[_translate(out_stem)]
+                    ext.batch_upload(self.h_x2, pre_out.contiguous().float())
+                    ao_t = torch.empty(opt.rows)
+                    ext.batch_bf16_io(
+                        self.h_x2, opt.handle, opt.handle, self.h_ao,
+                        1, opt.rows, opt.cols, False,
+                    )
+                    ext.batch_download(self.h_ao, ao_t)
+                    ext.batch_submit()
                 # The MoE input MUST come from the post-attention residual
                 # ``x + attention`` (same as sequential decode_step).
                 x1 = x + ao_t
@@ -2890,13 +2976,22 @@ class ResidentNVFP4(ResidentQwen35):
                         )
                 except OSError:
                     pass
-        x = self._rms(
-            x, self._dense("language_model.model.norm.weight"),
-            cfg.rms_norm_eps,
-        )
+        if not self._gpu_rms:
+            x = self._rms(
+                x, self._dense("language_model.model.norm.weight"),
+                cfg.rms_norm_eps,
+            )
         lm = self.pinned[_translate("language_model.lm_head")]
         ext.batch_begin()
-        ext.batch_upload(self.h_x_fused, x.contiguous().float())
+        if self._gpu_rms:
+            # Final norm on device inside the lm_head batch (h_x_resid is
+            # free at token end); h_x_fused then feeds the GEMV as before.
+            ext.batch_upload(self.h_x_resid, x.contiguous().float())
+            ext.batch_rms1p_io(
+                self.h_x_resid, self._in_w_res[-1], self.h_x_fused,
+                cfg.hidden_size, cfg.rms_norm_eps, 1)
+        else:
+            ext.batch_upload(self.h_x_fused, x.contiguous().float())
         logits_t = torch.empty(lm.rows)
         ext.batch_bf16_io(
             self.h_x_fused, lm.handle, lm.handle, self.h_y,
@@ -3095,22 +3190,27 @@ class ResidentNVFP4(ResidentQwen35):
         return qkv_t, z_t, a_t, b_t
 
     def _record_attn_in(
-        self, i: int, ext: Any,
+        self, i: int, ext: Any, download: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Record q_proj/k_proj/v_proj + downloads (full attention)."""
+        """Record q_proj/k_proj/v_proj + downloads (full attention).
+        ``download=False`` keeps the projections on the GPU (the caller's
+        device-side consumer runs in the same batch) and returns empties."""
         base = f"language_model.model.layers.{i}"
         q_s = self.pinned[_translate(f"{base}.self_attn.q_proj")]
         k_s = self.pinned[_translate(f"{base}.self_attn.k_proj")]
         v_s = self.pinned[_translate(f"{base}.self_attn.v_proj")]
-        qg_t = torch.empty(q_s.rows)
-        k_t = torch.empty(k_s.rows)
-        v_t = torch.empty(v_s.rows)
         ext.batch_bf16_io(self.h_x_fused, q_s.handle, q_s.handle,
                           self.h_qg, 1, q_s.rows, q_s.cols, False)
         ext.batch_bf16_io(self.h_x_fused, k_s.handle, k_s.handle,
                           self.h_k, 1, k_s.rows, k_s.cols, False)
         ext.batch_bf16_io(self.h_x_fused, v_s.handle, v_s.handle,
                           self.h_v, 1, v_s.rows, v_s.cols, False)
+        if not download:
+            empty = torch.empty(0)
+            return empty, empty, empty
+        qg_t = torch.empty(q_s.rows)
+        k_t = torch.empty(k_s.rows)
+        v_t = torch.empty(v_s.rows)
         ext.batch_download(self.h_qg, qg_t)
         ext.batch_download(self.h_k, k_t)
         ext.batch_download(self.h_v, v_t)

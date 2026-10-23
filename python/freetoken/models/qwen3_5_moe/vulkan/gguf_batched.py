@@ -119,10 +119,13 @@ class GgufBatchedMixin(GgufArenaMixin):
         return qkv_t, z_t, a_t, b_t
 
     def _record_attn_in(
-        self, i: int, ext: Any,
+        self, i: int, ext: Any, download: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Record q/k/v projections + downloads (full attention) with
-        dtype dispatch (q bf16, k/v fp32 after the init-time widening)."""
+        dtype dispatch (q bf16, k/v fp32 after the init-time widening).
+        ``download=False`` (FTV_GGUF_GPU_ATTN) keeps all three on the GPU -
+        the device prep kernel consumes them in the same batch - and
+        returns empties, mirroring the ``_record_gdn_in`` contract."""
         base = f"language_model.model.layers.{i}"
         q_s = self.pinned[_translate(f"{base}.self_attn.q_proj")]
         k_s = self.pinned[_translate(f"{base}.self_attn.k_proj")]
@@ -130,6 +133,9 @@ class GgufBatchedMixin(GgufArenaMixin):
         self._batch_pinned_matmul(self.h_x_fused, q_s, self.h_qg)
         self._batch_pinned_matmul(self.h_x_fused, k_s, self.h_k)
         self._batch_pinned_matmul(self.h_x_fused, v_s, self.h_v)
+        if not download:
+            empty = torch.empty(0)
+            return empty, empty, empty
         qg_t = torch.empty(q_s.rows)
         k_t = torch.empty(k_s.rows)
         v_t = torch.empty(v_s.rows)

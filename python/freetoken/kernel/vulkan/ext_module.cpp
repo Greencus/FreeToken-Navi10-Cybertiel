@@ -389,7 +389,67 @@ static void desc_cache_clear() {
     g_desc_cache_pool_used = 0;
 }
 
+// ------------------------------------------------------------
+// FTV_Q80 dense-shadow bookkeeping.  BF16 pins at or above
+// FTV_Q80_MIN_KB get a resident Q8_0 packed twin (created lazily on
+// first dense GEMV, capped at FTV_Q80_MB); subsequent batch/sync
+// bf16 GEMVs read the half-size twin instead.  Default OFF: with
+// FTV_Q80 unset every lookup below is skipped and today's exact
+// BF16 path runs byte-for-byte.  The helpers that create/dispatch
+// live next to batch_kernel_record; only the free-path bookkeeping
+// sits here (free_resident_vulkan must drop both directions).
+void free_resident_vulkan(int64_t handle);
+struct Q80Shadow {
+    int64_t shadow = 0;
+    uint32_t N = 0, K = 0, rowstride = 0;
+    // packed: the handle's OWN bytes are the GGUF's file Q8_0 slab (34 B
+    // blocks), not a bf16->Q8_0 twin; rowstride is the file row stride
+    // (no 64 B pad) and shadow == the declared handle itself.
+    bool packed = false;
+};
+static std::unordered_map<int64_t, Q80Shadow> g_q80;        // original -> twin
+static std::unordered_map<int64_t, int64_t> g_q80_owner;    // twin -> original
+static uint64_t g_q80_bytes = 0;              // TWIN bytes (FTV_Q80_MB budget)
+static uint64_t g_q80_created = 0;
+static uint64_t g_q80_dispatches = 0;
+static uint64_t g_q80_skipped_budget = 0;
+static uint64_t g_q80_packed_declared = 0;    // FTV_DENSE_Q80 file-slab pins
+static uint64_t g_q80_packed_bytes = 0;
+static uint64_t g_q80_packed_dispatches = 0;
+
+// Drop every registry entry keyed on `handle` (original or twin) and free
+// the counterpart twin.  TWIN bytes are accounted once, from g_q80;
+// packed entries have no twin (shadow == handle) and are not in that
+// budget.
+static void q80_drop_handle(int64_t handle) {
+    auto s = g_q80.find(handle);
+    if (s != g_q80.end()) {
+        int64_t sh = s->second.shadow;
+        if (s->second.packed) {
+            g_q80_packed_bytes -=
+                (uint64_t)s->second.N * s->second.rowstride;
+            g_q80_packed_declared--;   // live pins, like packed_bytes
+        } else {
+            g_q80_bytes -= (uint64_t)s->second.N * s->second.rowstride;
+        }
+        g_q80.erase(s);
+        g_q80_owner.erase(sh);
+        if (sh != handle) free_resident_vulkan(sh);
+        return;
+    }
+    auto o = g_q80_owner.find(handle);
+    if (o != g_q80_owner.end()) {
+        auto e = g_q80.find(o->second);
+        if (e != g_q80.end()) {
+            g_q80_bytes -= (uint64_t)e->second.N * e->second.rowstride;
+            g_q80.erase(e);
+        }
+        g_q80_owner.erase(o);
+    }
+}
+
 void free_resident_vulkan(int64_t handle) {
+    q80_drop_handle(handle);
     auto it = g_resident.find(handle);
     if (it == g_resident.end()) return;
     vku::Buffer buf = it->second;
@@ -1518,6 +1578,98 @@ static struct BatchState {
 
 static bool batch_open() { return g_batch.active; }
 
+// ============================================================
+// GPU timeline instrumentation (timestamp queries).
+//
+// One VkQueryPool (VK_QUERY_TYPE_TIMESTAMP, 64-bit, lazily created on
+// first enable).  While enabled, every recorded batch op (dispatch,
+// barrier, fill, copy) writes ONE timestamp AFTER itself, labelled with
+// the op (shader stem for dispatches); batch_begin writes a baseline
+// mark so the first op has a start.  Timestamps use the ALL_COMMANDS
+// stage, so mark[i] - mark[i-1] is exactly the GPU time between the two
+// ops.  batch_submit fetches the results after the fence and
+// accumulates (label, ns) pairs; batch_ts_read returns + clears them.
+// The whole path is gated on g_ts.enabled (default OFF) - a single
+// predictable branch per op when off, and it never changes the numerics
+// or the dispatch order (the timestamps are extra read-only commands).
+// ============================================================
+static constexpr uint32_t kTsPoolSize = 4096;  // power of two
+static struct TsState {
+    bool                       enabled   = false;
+    VkQueryPool                pool      = VK_NULL_HANDLE;  // lazy
+    float                      period    = 10.0f;  // ns/tick (device prop)
+    uint32_t                   used      = 0;      // queries written
+    bool                       truncated = false;  // pool exhausted
+    std::vector<std::string>   labels;             // one per query
+    // Accumulated per-op results across batch_submit calls until read.
+    std::vector<std::pair<std::string, double>> acc;  // (label, ns)
+} g_ts;
+
+static void ts_pool_ensure() {
+    if (g_ts.pool != VK_NULL_HANDLE) return;
+    auto& ctx = get_ctx();
+    g_ts.period = ctx.properties.limits.timestampPeriod;
+    if (g_ts.period <= 0.0f) g_ts.period = 1.0f;
+    VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qpci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+    qpci.queryCount = kTsPoolSize;
+    VKU_CHECK(vkCreateQueryPool(ctx.device, &qpci, nullptr, &g_ts.pool));
+}
+
+// One timestamp mark after the just-recorded op, attributed to `label`.
+static void ts_mark(const std::string& label) {
+    if (!g_ts.enabled || g_batch.cbuf == VK_NULL_HANDLE) return;
+    if (g_ts.used >= kTsPoolSize) { g_ts.truncated = true; return; }
+    vkCmdWriteTimestamp(g_batch.cbuf, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        g_ts.pool, g_ts.used);
+    g_ts.labels.push_back(label);
+    ++g_ts.used;
+}
+
+// Shader stem as the phase label: "linear_bf16_resident_f32.comp.spv"
+// -> "linear_bf16_resident_f32".
+static std::string ts_shader_label(const std::string& shader) {
+    const size_t dot = shader.find('.');
+    return dot == std::string::npos ? shader : shader.substr(0, dot);
+}
+
+static void batch_ts_enable_vulkan(bool enable) {
+    TORCH_CHECK(!g_batch.active,
+                "batch_ts_enable must be called with no open batch");
+    g_ts.enabled = enable;
+    if (enable) ts_pool_ensure();
+}
+
+// After batch_submit's fence: fetch this batch's marks, accumulate
+// (label, delta_ns) per op, and clear.  Returns (pairs, truncated).
+static std::tuple<std::vector<std::pair<std::string, double>>, bool>
+batch_ts_read_vulkan() {
+    std::vector<std::pair<std::string, double>> out;
+    out.swap(g_ts.acc);
+    const bool trunc = g_ts.truncated;
+    g_ts.truncated = false;
+    return {out, trunc};
+}
+
+// Fetch the open batch's just-completed marks into g_ts.acc.  Called
+// from batch_submit AFTER the fence (queries are then complete; the
+// WAIT flag is belt-and-braces).  Delta i = stamps[i] - stamps[i-1] is
+// attributed to labels[i]; labels[0] is the batch_begin baseline.
+static void ts_fetch_batch_locked() {
+    if (!g_ts.enabled || g_ts.used == 0) return;
+    std::vector<uint64_t> stamps(g_ts.used);
+    const VkResult r = vkGetQueryPoolResults(
+        get_ctx().device, g_ts.pool, 0, g_ts.used,
+        (VkDeviceSize)(g_ts.used * sizeof(uint64_t)), stamps.data(),
+        sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (r != VK_SUCCESS) return;
+    const double ns_per_tick = (double)g_ts.period;
+    for (uint32_t i = 1; i < g_ts.used; ++i) {
+        const double ns = (double)(stamps[i] - stamps[i - 1]) * ns_per_tick;
+        g_ts.acc.emplace_back(g_ts.labels[i], ns);
+    }
+}
+
 // Drain the mid-batch deferrals after a completed submission: the fence has
 // been waited, so deferred buffer destruction, the deferred cache-pool reset
 // and retired transient pools are all safe to release now.  Called from
@@ -1714,6 +1866,7 @@ static void batch_cross_barrier_vulkan() {
                              | VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 1, &mb, 0, nullptr, 0, nullptr);
     ++g_cross_total;
+    ts_mark("cross_barrier");
 }
 
 // Safety net: wait every in-flight queue-2 batch and recycle its staging
@@ -1763,6 +1916,52 @@ static void batch_barrier(VkCommandBuffer cb, VkPipelineStageFlags src,
     vkCmdPipelineBarrier(cb, src, dst, 0, 1, &mb, 0, nullptr, 0, nullptr);
     ++g_barrier_total;
     ++g_barrier_batch;
+    ts_mark("barrier");
+}
+
+// Micro-benchmark hook (tests/kernel/vulkan/bench_phase_attribution.py):
+// record one barrier variant directly, bypassing the hazard logic, so a
+// replay of N dispatches can price today's device-scope barrier against
+// a shader-scoped one against no barrier at all.  mode 0 = today's
+// device-scope COMPUTE|TRANSFER / MEMORY_WRITE -> MEMORY_READ|WRITE;
+// mode 1 = shader-scoped COMPUTE / SHADER_WRITE -> SHADER_READ; mode 2 =
+// no barrier.  All modes write a timestamp mark so the caller can also
+// read the mark-attributed cost.  Counter columns intentionally NOT
+// bumped: this is a probe, not a real hazard barrier.
+static void batch_barrier_probe_vulkan(int64_t mode) {
+    TORCH_CHECK(g_batch.active, "batch_barrier_probe outside an open batch");
+    switch (mode) {
+    case 0: {  // today's batch_barrier, verbatim masks + stages
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT
+                           | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(g_batch.cbuf,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                 | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                 | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
+        ts_mark("barrier_probe");
+        break;
+    }
+    case 1: {  // shader-scoped variant
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g_batch.cbuf,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
+        ts_mark("barrier_probe");
+        break;
+    }
+    case 2:
+        ts_mark("barrier_probe");  // nothing between the marks
+        break;
+    default:
+        TORCH_CHECK(false, "batch_barrier_probe mode must be 0, 1 or 2");
+    }
 }
 
 static void batch_begin_vulkan() {
@@ -1786,6 +1985,16 @@ static void batch_begin_vulkan() {
     g_batch.active = true;
     g_batch.acc.clear();  // fresh submission: fence already ordered all prior
                           // accesses, so hazard state starts empty
+    if (g_ts.enabled) {
+        g_ts.used = 0;
+        g_ts.labels.clear();
+        auto& ctx = get_ctx();
+        if (ctx.has_host_query_reset)
+            vkResetQueryPool(ctx.device, g_ts.pool, 0, kTsPoolSize);
+        else
+            vkCmdResetQueryPool(g_batch.cbuf, 0, 0, kTsPoolSize);
+        ts_mark("batch_begin");  // baseline: first op's delta starts here
+    }
 }
 
 // Order a recorded op against prior accesses in this batch.  `touches` is
@@ -1853,6 +2062,7 @@ static void batch_upload_vulkan(int64_t handle, torch::Tensor tensor,
     c.dstOffset = (VkDeviceSize)offset;
     c.size = (VkDeviceSize)bytes;
     vkCmdCopyBuffer(g_batch.cbuf, staging.buf, dst.buf, 1, &c);
+    ts_mark("upload_copy");
     g_batch.uploads.push_back(staging);
 }
 
@@ -1923,6 +2133,7 @@ static void batch_upload_multi_vulkan(
         vkCmdCopyBuffer(g_batch.cbuf, staging[i].buf, dsts[i], 1, &c);
         g_batch.uploads.push_back(std::move(staging[i]));
     }
+    ts_mark("upload_copy");
 }
 
 static void batch_fill_vulkan(int64_t handle, float value, int64_t count) {
@@ -1934,6 +2145,7 @@ static void batch_fill_vulkan(int64_t handle, float value, int64_t count) {
     uint32_t bits;
     std::memcpy(&bits, &value, sizeof(bits));
     vkCmdFillBuffer(g_batch.cbuf, dst.buf, 0, bytes, bits);
+    ts_mark("fill");
 }
 
 static void batch_kernel_record(const std::string& shader,
@@ -1977,6 +2189,197 @@ static void batch_kernel_record(const std::string& shader,
                            VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
     }
     vkCmdDispatch(g_batch.cbuf, gx, gy, 1);
+    ts_mark(ts_shader_label(shader));
+}
+
+// ============================================================
+// FTV_Q80 dense-shadow helpers (see the bookkeeping block above
+// free_resident_vulkan).  Nonzero numeric string enables, matching
+// the FTV_NVFP4_M1 convention ("true" stays OFF - atoi("true")==0).
+// ============================================================
+static bool q80_enabled() {
+    const char* e = std::getenv("FTV_Q80");
+    return e != nullptr && *e != '\0' && std::atoi(e) != 0;
+}
+
+// Row stride of the Q8_0 slab: 36 B per 32-value block, padded to 64 B.
+static uint32_t q80_rowstride(int64_t K) {
+    uint64_t blocks = ((uint64_t)K + 31u) / 32u;
+    return (uint32_t)(((blocks * 36u) + 63u) & ~63ull);
+}
+
+// Row stride of the GGUF FILE's Q8_0 rows (ggml block_q8_0 = 34 B:
+// fp16 d + 32 x int8, no padding between blocks or rows).  K must be a
+// multiple of 32 - every Q8_0 tensor in a valid file is.
+static uint32_t q80_gguf_rowstride(int64_t K) {
+    TORCH_CHECK(K > 0 && K % 32 == 0, "Q8_0 packed K must be a multiple of 32");
+    return (uint32_t)((uint64_t)K / 32u * 34u);
+}
+
+// Whether (h_w, N, K) will be served by a Q8_0 dispatch: a declared
+// FILE-slab pin (FTV_DENSE_Q80) always wins - its bytes ARE Q8_0, so
+// shadowing it from the bf16 view would be wrong - otherwise the FTV_Q80
+// shadow path when its env is on.
+static bool q80_serve(int64_t h_w) {
+    auto it = g_q80.find(h_w);
+    if (it != g_q80.end() && it->second.packed) return true;
+    return q80_enabled();
+}
+
+// Declare a resident handle as holding the GGUF file's OWN Q8_0 bytes
+// (rows x rowstride, rowstride = K/32*34), so the dense GEMV reads the
+// file-exact weights with zero bf16 widening in VRAM.  Additive,
+// default-off: only called by the engine when FTV_DENSE_Q80=1.  The
+// dispatch itself keys on this declaration, never on an env at record
+// time, so a handle can never be misread as bf16.
+static void q80_declare_packed(int64_t h_w, int64_t N, int64_t K) {
+    TORCH_CHECK(N > 0, "q80 packed: N must be positive");
+    const uint32_t rb = q80_gguf_rowstride(K);
+    auto it = g_q80.find(h_w);
+    if (it != g_q80.end()) {
+        TORCH_CHECK(it->second.packed &&
+                        (int64_t)it->second.N == N &&
+                        (int64_t)it->second.K == K,
+                    "Q8_0 handle already declared with a different shape");
+        return;
+    }
+    auto r = g_resident.find(h_w);
+    TORCH_CHECK(r != g_resident.end(), "q80 packed: unknown resident handle");
+    TORCH_CHECK((int64_t)r->second.size >= (int64_t)N * (int64_t)rb,
+                "q80 packed: resident buffer smaller than the Q8_0 slab");
+    g_q80.emplace(h_w, Q80Shadow{h_w, (uint32_t)N, (uint32_t)K, rb,
+                                 /*packed=*/true});
+    g_q80_owner.emplace(h_w, h_w);
+    g_q80_packed_declared++;
+    g_q80_packed_bytes += (uint64_t)N * rb;
+}
+
+// Find-or-create the Q8_0 twin for (h_w, N, K).  Returns 0 when there is
+// no twin: env off, below FTV_Q80_MIN_KB, over FTV_Q80_MB (first-come),
+// or shape mismatch (a pinned handle must never change shape).
+// in_batch records the quantize dispatch into the open batch; otherwise
+// it runs synchronously (sync-path callers submit it before the GEMV).
+static int64_t q80_ensure(int64_t h_w, int64_t N, int64_t K, bool in_batch) {
+    auto it = g_q80.find(h_w);
+    if (it != g_q80.end()) {
+        TORCH_CHECK((int64_t)it->second.N == N && (int64_t)it->second.K == K,
+                    "FTV_Q80 handle reused with a different shape");
+        return it->second.shadow;
+    }
+    const char* mk = std::getenv("FTV_Q80_MIN_KB");
+    int64_t min_kb = (mk != nullptr && *mk != '\0') ? std::atoll(mk) : 16000;
+    const uint64_t wbytes = (uint64_t)N * (uint64_t)K * 2ull;
+    if (wbytes < (uint64_t)min_kb * 1024ull) return 0;
+    TORCH_CHECK(g_resident.at(h_w).size >= wbytes, "resident weight too small");
+    const char* mb = std::getenv("FTV_Q80_MB");
+    uint64_t budget =
+        ((uint64_t)((mb != nullptr && *mb != '\0') ? std::atoll(mb) : 700)) << 20;
+    const uint32_t rb = q80_rowstride(K);
+    const uint64_t need = (uint64_t)N * rb;
+    if (g_q80_bytes + need > budget) {
+        g_q80_skipped_budget++;
+        return 0;
+    }
+    int64_t sh = allocate_resident_vulkan((int64_t)need);
+    struct QP { uint32_t N, K, rowstride; } qp{(uint32_t)N, (uint32_t)K, rb};
+    VkBuffer w = resident_buf(h_w), qs = resident_buf(sh);
+    if (in_batch) {
+        TORCH_CHECK(batch_open(), "q80_ensure(in_batch) outside an open batch");
+        batch_kernel_record("quant_bf16_q80.comp.spv", {w, qs}, {0, 1},
+                            &qp, sizeof(qp), (uint32_t)N, 1);
+    } else {
+        run_kernel(get_pipeline("quant_bf16_q80.comp.spv", 2, 12),
+                   {w, qs}, &qp, (uint32_t)N, 1, 1);
+    }
+    g_q80.emplace(h_w, Q80Shadow{sh, (uint32_t)N, (uint32_t)K, rb});
+    g_q80_owner.emplace(sh, h_w);
+    g_q80_bytes += need;
+    g_q80_created++;
+    return sh;
+}
+
+// Shader for the packed GGUF Q8_0 GEMV.  "" (default) is linear_q80gguf_wv
+// - the hand-unswitched 2-stream kernel, ~1.8-2.0x the byte-gather resident
+// kernel on every measured shape and bit-identical to it.  The byte-gather
+// original stays reachable as FTV_Q80_GGUF_VARIANT=ref (the A/B baseline);
+// set_q80gguf_variant (pybind, wins over the env) selects any variant.  All
+// variants share the 20-byte push block and the first four bindings; lds2
+// binds the weight buffer twice - dword view at 0, uvec2 view at 4 - so the
+// segment staging can use 8-byte loads while the dword fallback keeps ref's
+// exact load semantics.
+static std::string g_q80gguf_variant;
+static bool g_q80gguf_variant_ready = false;
+
+static const std::string& q80gguf_variant() {
+    if (!g_q80gguf_variant_ready) {
+        const char* e = std::getenv("FTV_Q80_GGUF_VARIANT");
+        if (e != nullptr && *e != '\0') g_q80gguf_variant = e;
+        g_q80gguf_variant_ready = true;
+    }
+    return g_q80gguf_variant;
+}
+
+static const char* q80gguf_shader() {
+    const std::string& v = q80gguf_variant();
+    if (v == "ref") return "linear_q80gguf_ref_f32.comp.spv";
+    if (v == "sg") return "linear_q80gguf_sg_f32.comp.spv";
+    if (v == "lds") return "linear_q80gguf_lds_f32.comp.spv";
+    if (v == "lds2") return "linear_q80gguf_lds2_f32.comp.spv";
+    if (v == "rt") return "linear_q80gguf_rt_f32.comp.spv";
+    if (v == "pt") return "linear_q80gguf_pt_f32.comp.spv";
+    if (v == "tp") return "linear_q80gguf_tp_f32.comp.spv";
+    if (v == "pa") return "linear_q80gguf_pa_f32.comp.spv";
+    if (v == "pb") return "linear_q80gguf_pb_f32.comp.spv";
+    if (v == "pv") return "linear_q80gguf_pv_f32.comp.spv";
+    if (v == "w64") return "linear_q80gguf_w64_f32.comp.spv";
+    if (v == "wp") return "linear_q80gguf_wp_f32.comp.spv";
+    if (v == "wpa") return "linear_q80gguf_wpa_f32.comp.spv";
+    if (v == "wb") return "linear_q80gguf_wb_f32.comp.spv";
+    if (v == "wv") return "linear_q80gguf_wv_f32.comp.spv";
+    return "linear_q80gguf_wv_f32.comp.spv";
+}
+
+static uint32_t q80gguf_nbuf() {
+    return q80gguf_variant() == "lds2" ? 5u : 4u;
+}
+
+// pybind override: wins over the env (which is only read on first use),
+// so one process can diff every variant against the running default.
+static void q80gguf_set_variant(const char* v) {
+    g_q80gguf_variant = (v != nullptr && *v != '\0') ? v : "";
+    g_q80gguf_variant_ready = true;
+}
+
+// The Q8_0 GEMV itself: mirrors batch_bf16_io_vulkan's record (same
+// bindings order/flags, same grid (N, T)) with the twin as weight.
+// Packed declarations read the file layout (linear_q80gguf, 34 B
+// blocks); twins read the 36 B shadow layout (linear_q80).
+static void q80_record_gemm(int64_t sh, int64_t x_handle, int64_t h_b,
+                            int64_t y_handle, int64_t T, int64_t N,
+                            int64_t K, bool use_bias) {
+    auto it = g_q80_owner.find(sh);
+    TORCH_CHECK(it != g_q80_owner.end(), "Q8_0 GEMV on an unregistered twin");
+    const Q80Shadow& s = g_q80.at(it->second);
+    struct PC {
+        uint32_t T, N, K, use_bias, rowstride;
+    } pc{(uint32_t)T, (uint32_t)N, (uint32_t)K, use_bias ? 1u : 0u, s.rowstride};
+    VkBuffer w = resident_buf(sh);
+    VkBuffer b = use_bias ? resident_buf(h_b) : w;
+    if (s.packed) {
+        std::vector<VkBuffer> bufs{w, b, resident_buf(x_handle),
+                                   resident_buf(y_handle)};
+        std::vector<uint8_t> acc{0, 0, 0, 1};
+        if (q80gguf_nbuf() == 5) { bufs.push_back(w); acc.push_back(0); }
+        batch_kernel_record(q80gguf_shader(), bufs, acc,
+                            &pc, sizeof(pc), (uint32_t)N, (uint32_t)T);
+        g_q80_packed_dispatches++;
+    } else {
+        batch_kernel_record("linear_q80_resident_f32.comp.spv",
+                            {w, b, resident_buf(x_handle), resident_buf(y_handle)},
+                            {0, 0, 0, 1},
+                            &pc, sizeof(pc), (uint32_t)N, (uint32_t)T);
+        g_q80_dispatches++;
+    }
 }
 
 // NVFP4 dispatch inside a batch. kind: "plain" | "gateup" | "acc".
@@ -2337,6 +2740,16 @@ static void batch_moe_kquant_fused_record_vulkan(
 static void batch_bf16_io_vulkan(int64_t x_handle, int64_t h_w, int64_t h_b,
                                  int64_t y_handle, int64_t T, int64_t N,
                                  int64_t K, bool use_bias) {
+    // FTV_DENSE_Q80: a declared file slab serves the weight as-is.
+    // FTV_Q80: otherwise serve qualifying weights from their Q8_0 twin
+    // (quantize recorded once, at first use, in this batch).
+    if (q80_serve(h_w)) {
+        int64_t sh = q80_ensure(h_w, N, K, /*in_batch=*/true);
+        if (sh != 0) {
+            q80_record_gemm(sh, x_handle, h_b, y_handle, T, N, K, use_bias);
+            return;
+        }
+    }
     struct PC {
         uint32_t T, N, K, use_bias;
     } pc{(uint32_t)T, (uint32_t)N, (uint32_t)K, use_bias ? 1u : 0u};
@@ -2425,6 +2838,53 @@ static void batch_swiglu_io_vulkan(int64_t h_gate, int64_t h_up,
                         &pc, sizeof(pc), (uint32_t)((N + 255) / 256), 1);
 }
 
+// Qwen3.5 full-attention Q/K prep inside a batch (FTV_GGUF_GPU_ATTN): the
+// per-head zero-centered RMS (y = x*rsqrt(mean(x^2)+eps)*(1+w)) + partial
+// RoPE (GPT-NeoX halves, cos/sin row `pos`) in place on the fused qg query
+// half and on k, then the KV append into the capacity-strided device cache
+// plus the host-writeback staging row.  One 256-thread WG per row;
+// gx = hq (query rows) + hkv (key rows).  Exactly 9 bindings (the
+// batch_kernel_record desc-cache cap).
+static void batch_attn_prep_qwen35_io_vulkan(
+    int64_t h_qg, int64_t h_k, int64_t h_v, int64_t h_kcache,
+    int64_t h_vcache, int64_t h_stage, int64_t h_cos, int64_t h_sin,
+    int64_t h_qkn, int64_t pos, int64_t capacity, int64_t hq, int64_t hkv,
+    int64_t hd, int64_t rotary, double eps) {
+    struct PC {
+        uint32_t pos, capacity, hq, hkv, hd, rotary;
+        float eps;
+    } pc{(uint32_t)pos, (uint32_t)capacity, (uint32_t)hq, (uint32_t)hkv,
+         (uint32_t)hd, (uint32_t)rotary, (float)eps};
+    batch_kernel_record(
+        "attn_qwen35_prep_f32.comp.spv",
+        {resident_buf(h_qg), resident_buf(h_k), resident_buf(h_v),
+         resident_buf(h_kcache), resident_buf(h_vcache), resident_buf(h_stage),
+         resident_buf(h_cos), resident_buf(h_sin), resident_buf(h_qkn)},
+        {1, 1, 0, 1, 1, 1, 0, 0, 0},
+        &pc, sizeof(pc), (uint32_t)(hq + hkv), 1);
+}
+
+// Single-query GQA attention over the device KV cache + the sigmoid output
+// gate folded in-shader (FTV_GGUF_GPU_ATTN decode lane): the Qwen3.5
+// variant of the gpt_oss flash core with D=256 / BC=16.  One WG per query
+// head; gx = hq; out lands in h_out (the o_proj input buffer) as fp32.
+static void batch_attn_fwd_qwen35_io_vulkan(
+    int64_t h_qg, int64_t h_kcache, int64_t h_vcache, int64_t h_out,
+    int64_t pos, int64_t capacity, int64_t hq, int64_t hkv, int64_t hd,
+    double scale) {
+    struct PC {
+        uint32_t pos, capacity, hq, hkv, hd, stride;
+        float scale;
+    } pc{(uint32_t)pos, (uint32_t)capacity, (uint32_t)hq, (uint32_t)hkv,
+         (uint32_t)hd, (uint32_t)(2 * hd), (float)scale};
+    batch_kernel_record(
+        "attn_qwen35_fwd_d256_f32.comp.spv",
+        {resident_buf(h_qg), resident_buf(h_kcache), resident_buf(h_vcache),
+         resident_buf(h_out)},
+        {0, 0, 0, 1},
+        &pc, sizeof(pc), (uint32_t)hq, 1);
+}
+
 // GDN conv taps inside a batch: mixed = silu(taps . [buf, qkv]) with
 // in-place conv history shift (task #13: GPU-resident GDN recurrence).
 // h_qkv/h_buf/h_taps/h_mixed are resident fp32; taps is [C,4] fp32.
@@ -2500,6 +2960,7 @@ static void batch_download_vulkan(int64_t handle, torch::Tensor out,
     c.srcOffset = (VkDeviceSize)offset;
     c.size = (VkDeviceSize)bytes;
     vkCmdCopyBuffer(g_batch.cbuf, src.buf, staging.buf, 1, &c);
+    ts_mark("download_copy");
     g_batch.readbacks.push_back({staging, oc, bytes});
 }
 
@@ -2541,6 +3002,9 @@ static double batch_submit_vulkan(
                               UINT64_C(30'000'000'000)));
     VKU_CHECK(vkResetFences(ctx.device, 1, &g_batch.fence));
     auto t1 = std::chrono::steady_clock::now();
+    // Timeline mode: pull this batch's GPU timestamps while the pool is
+    // hot; batch_ts_read hands them to Python and clears the accumulator.
+    ts_fetch_batch_locked();
     for (auto& rb : g_batch.readbacks) {
         vku::download(ctx, rb.staging, rb.out.data_ptr<float>(), rb.bytes);
         get_pool().release_host(rb.staging);
@@ -2574,6 +3038,44 @@ static double batch_submit_vulkan(
 void linear_bf16_resident_io_vulkan(
     int64_t x_handle, int64_t h_w, int64_t h_b, int64_t y_handle,
     int64_t T, int64_t N, int64_t K, bool use_bias) {
+    // FTV_DENSE_Q80 sync: a declared file slab dispatches the GGUF-layout
+    // Q8_0 GEMV directly (no quantize - the bytes already are Q8_0).
+    // FTV_Q80 sync twin: create-if-needed runs the quantize here (one
+    // submit) and the GEMV follows in its own submit, fence-ordered.
+    // Keeps both fork2 arms on identical weights in either mode.
+    if (q80_serve(h_w)) {
+        auto e = g_q80.find(h_w);
+        if (e != g_q80.end() && e->second.packed) {
+            const Q80Shadow& s = e->second;
+            struct PC {
+                uint32_t T, N, K, use_bias, rowstride;
+            } pc{(uint32_t)T, (uint32_t)N, (uint32_t)K, use_bias ? 1u : 0u,
+                 s.rowstride};
+            VkBuffer w = resident_buf(h_w);
+            VkBuffer b = use_bias ? resident_buf(h_b) : w;
+            std::vector<VkBuffer> bufs{w, b, resident_buf(x_handle),
+                                       resident_buf(y_handle)};
+            if (q80gguf_nbuf() == 5) bufs.push_back(w);
+            run_kernel(get_pipeline(q80gguf_shader(), q80gguf_nbuf(), 20),
+                       bufs, &pc, (uint32_t)N, (uint32_t)T, 1);
+            g_q80_packed_dispatches++;
+            return;
+        }
+        int64_t sh = q80_ensure(h_w, N, K, /*in_batch=*/false);
+        if (sh != 0) {
+            struct PC {
+                uint32_t T, N, K, use_bias, rowstride;
+            } pc{(uint32_t)T, (uint32_t)N, (uint32_t)K, use_bias ? 1u : 0u,
+                 g_q80.at(h_w).rowstride};
+            VkBuffer w = resident_buf(sh);
+            VkBuffer b = use_bias ? resident_buf(h_b) : w;
+            run_kernel(get_pipeline("linear_q80_resident_f32.comp.spv", 4, 20),
+                       {w, b, resident_buf(x_handle), resident_buf(y_handle)},
+                       &pc, (uint32_t)N, (uint32_t)T, 1);
+            g_q80_dispatches++;
+            return;
+        }
+    }
     auto& pipe=get_pipeline("linear_bf16_resident_f32.comp.spv",4,16);
     struct PC{uint32_t T,N,K,use_bias;}pc{(uint32_t)T,(uint32_t)N,(uint32_t)K,use_bias?1u:0u};
     VkBuffer w=resident_buf(h_w),b=use_bias?resident_buf(h_b):w;
@@ -3549,6 +4051,68 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               return {int64_t(g_submit_total), int64_t(g_submit_batch)};
           },
           "(cumulative submissions, submissions in open batch).");
+    m.def("batch_ts_enable", &batch_ts_enable_vulkan,
+          "Enable/disable GPU timeline instrumentation: while on, every "
+          "recorded batch op writes a timestamp query (ALL_COMMANDS stage) "
+          "after itself; batch_submit fetches the deltas post-fence.  "
+          "Read-only w.r.t. the recorded commands - numerics and dispatch "
+          "order are unchanged.  Must be called with no open batch.",
+          py::arg("enable"));
+    m.def("batch_ts_read", &batch_ts_read_vulkan,
+          "Return ([(label, ns), ...], truncated) accumulated by the "
+          "timeline instrumentation since the last call; called after "
+          "batch_submit.  labels: shader stems for dispatches, "
+          "'barrier'/'cross_barrier'/'fill'/'upload_copy'/'download_copy' "
+          "for the rest.");
+    m.def("batch_barrier_probe", &batch_barrier_probe_vulkan,
+          "Micro-benchmark hook: record one barrier variant bypassing the "
+          "hazard logic (0 = today's device-scope COMPUTE|TRANSFER "
+          "MEMORY_WRITE->MEMORY_READ|WRITE, 1 = shader-scoped COMPUTE "
+          "SHADER_WRITE->SHADER_READ, 2 = none).  Writes a "
+          "'barrier_probe' timestamp mark; does not bump the hazard "
+          "barrier counters.",
+          py::arg("mode"));
+    m.def("declare_q80_packed",
+          [](int64_t handle, int64_t rows, int64_t cols) {
+              q80_declare_packed(handle, rows, cols);
+          },
+          py::arg("handle"), py::arg("rows"), py::arg("cols"),
+          "Declare a resident handle as the GGUF file's OWN Q8_0 slab "
+          "(rows x cols, rowstride = cols/32*34 bytes): the dense GEMV "
+          "then reads file-exact Q8_0 with no bf16 widening.  The engine "
+          "calls this only under FTV_DENSE_Q80=1; the dispatch keys on "
+          "the declaration itself, so an undeclared handle can never be "
+          "misread.  Default: nothing declared, bf16 path unchanged.");
+    m.def("set_q80gguf_variant",
+          [](const char* v) { q80gguf_set_variant(v); },
+          py::arg("variant"),
+          "Select the packed GGUF Q8_0 GEMV shader for the process: "
+          "'\"\"' (default) = the hand-unswitched linear_q80gguf_wv, or one "
+          "of the bit-identical variants ref (byte-gather A/B baseline) / "
+          "sg / lds / lds2 / rt / pt / tp / pa / pb / pv / w64 / wp / wpa / "
+          "wb / wv.  Overrides FTV_Q80_GGUF_VARIANT.  Unknown names fall "
+          "back to the default shader.");
+    m.def("q80gguf_variant", []() -> std::string {
+              return q80gguf_variant();
+          },
+          "Currently selected packed GGUF Q8_0 GEMV variant "
+          "(empty string = production default).");
+    m.def("q80_stats", []() -> py::dict {
+              py::dict d;
+              d["enabled"] = q80_enabled();
+              d["handles"] = (int64_t)g_q80.size();
+              d["bytes"] = (int64_t)g_q80_bytes;
+              d["created"] = (int64_t)g_q80_created;
+              d["dispatches"] = (int64_t)g_q80_dispatches;
+              d["skipped_budget"] = (int64_t)g_q80_skipped_budget;
+              d["packed_declared"] = (int64_t)g_q80_packed_declared;
+              d["packed_bytes"] = (int64_t)g_q80_packed_bytes;
+              d["packed_dispatches"] = (int64_t)g_q80_packed_dispatches;
+              return d;
+          },
+          "FTV_Q80/FTV_DENSE_Q80 registry state: live entries, twin bytes, "
+          "quantizes performed, GEMVs served from twins, budget skips, and "
+          "the declared file-slab pins (count/bytes/GEMVs).");
     m.def("batch_upload", &batch_upload_vulkan,
           "Record a host->device copy into the open batch.",
           py::arg("handle"), py::arg("tensor"), py::arg("offset") = 0);
@@ -3649,6 +4213,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Record y = silu(gate)*up elementwise fold into the open batch.",
           py::arg("h_gate"), py::arg("h_up"), py::arg("h_out"),
           py::arg("N"));
+    m.def("batch_attn_prep_qwen35_io", &batch_attn_prep_qwen35_io_vulkan,
+          "Record Qwen3.5 full-attn Q/K prep (per-head RMS + partial RoPE "
+          "in place, KV append to the device cache + writeback staging) into "
+          "the open batch.",
+          py::arg("h_qg"), py::arg("h_k"), py::arg("h_v"),
+          py::arg("h_kcache"), py::arg("h_vcache"), py::arg("h_stage"),
+          py::arg("h_cos"), py::arg("h_sin"), py::arg("h_qkn"),
+          py::arg("pos"), py::arg("capacity"), py::arg("hq"), py::arg("hkv"),
+          py::arg("hd"), py::arg("rotary"), py::arg("eps"));
+    m.def("batch_attn_fwd_qwen35_io", &batch_attn_fwd_qwen35_io_vulkan,
+          "Record single-query GQA attention over the device KV cache + "
+          "sigmoid gate (Qwen3.5, D=256) into the open batch.",
+          py::arg("h_qg"), py::arg("h_kcache"), py::arg("h_vcache"),
+          py::arg("h_out"), py::arg("pos"), py::arg("capacity"),
+          py::arg("hq"), py::arg("hkv"), py::arg("hd"), py::arg("scale"));
     m.def("batch_gdn_conv_io", &batch_gdn_conv_io_vulkan,
           "Record GDN conv taps + silu + history shift into the open batch.",
           py::arg("h_qkv"), py::arg("h_buf"), py::arg("h_taps"),

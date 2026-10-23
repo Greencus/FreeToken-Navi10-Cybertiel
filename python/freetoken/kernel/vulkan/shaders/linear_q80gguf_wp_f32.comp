@@ -1,0 +1,93 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+// Q8_0 GEMV over the GGUF file's OWN packed bytes (FTV_Q80_GGUF_VARIANT=
+// wp): w64's two reference streams per 64-lane lane, software-pipelined
+// - iteration m fetches both segments m+1 while fmaring m, hiding the
+// gather's load latency behind the previous elements' chains.  Both
+// streams keep ascending fma order (only the fetch moves earlier), so
+// every output bit matches ref; 0 barriers, 2 loads per element.
+layout(local_size_x=64) in;
+layout(std430,binding=0) readonly buffer QBuf { uint Q[]; };
+layout(std430,binding=1) readonly buffer BBuf { uint16_t B[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) writeonly buffer YBuf { float Y[]; };
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint use_bias; uint rowstride;
+} p;
+
+float bf16(uint bits) { return uintBitsToFloat(bits << 16u); }
+
+// Round f32 -> bf16, round-to-nearest-even (same as torch.bfloat16()).
+float to_bf16(float v) {
+  uint f = floatBitsToUint(v);
+  f = f + 0x7FFFu + ((f >> 16u) & 1u);   // RNE: half-ulp bias + lsb
+  return uintBitsToFloat(f & 0xFFFF0000u);
+}
+
+void main() {
+  uint n = gl_WorkGroupID.x, t = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+  if (n >= p.N || t >= p.T) return;
+  float accA = 0.0, accB = 0.0;
+  uint wb = n * p.rowstride, xo = t * p.K;
+  // current segments (fetched out of band) + lookahead slots
+  float dAc = 0.0, dAn = 0.0, dBc = 0.0, dBn = 0.0;
+  int qAc = 0, qAn = 0, qBc = 0, qBn = 0;
+  bool hAc = false, hAn = false, hBc = false, hBn = false;
+  uint kAc = tid, kAn = 0u, kBc = tid + 64u, kBn = 0u;
+  // prologue: fetch iteration 0 (stream A only if it exists)
+  hAc = kAc < p.K;
+  if (hAc) {
+    uint bs = wb + (kAc >> 5u) * 34u;
+    uint wd = (Q[bs >> 2u] >> ((bs & 3u) * 8u)) & 0xFFFFu;
+    uint ca = bs + 2u + (kAc & 31u);
+    uint q8 = (Q[ca >> 2u] >> ((ca & 3u) * 8u)) & 0xFFu;
+    dAc = float(unpackHalf2x16(wd).x);
+    qAc = q8 >= 0x80u ? int(q8) - 256 : int(q8);
+  }
+  hBc = kBc < p.K;
+  if (hBc) {
+    uint bs = wb + (kBc >> 5u) * 34u;
+    uint wd = (Q[bs >> 2u] >> ((bs & 3u) * 8u)) & 0xFFFFu;
+    uint ca = bs + 2u + (kBc & 31u);
+    uint q8 = (Q[ca >> 2u] >> ((ca & 3u) * 8u)) & 0xFFu;
+    dBc = float(unpackHalf2x16(wd).x);
+    qBc = q8 >= 0x80u ? int(q8) - 256 : int(q8);
+  }
+  for (uint m = 0u; (m << 7u) < p.K; ++m) {
+    // fetch segments m+1 into the lookahead slots while fmaring m
+    kAn = kAc + 128u; kBn = kBc + 128u;
+    hAn = kAn < p.K; hBn = kBn < p.K;
+    if (hAn) {
+      uint bs = wb + (kAn >> 5u) * 34u;
+      uint wd = (Q[bs >> 2u] >> ((bs & 3u) * 8u)) & 0xFFFFu;
+      uint ca = bs + 2u + (kAn & 31u);
+      uint q8 = (Q[ca >> 2u] >> ((ca & 3u) * 8u)) & 0xFFu;
+      dAn = float(unpackHalf2x16(wd).x);
+      qAn = q8 >= 0x80u ? int(q8) - 256 : int(q8);
+    }
+    if (hBn) {
+      uint bs = wb + (kBn >> 5u) * 34u;
+      uint wd = (Q[bs >> 2u] >> ((bs & 3u) * 8u)) & 0xFFFFu;
+      uint ca = bs + 2u + (kBn & 31u);
+      uint q8 = (Q[ca >> 2u] >> ((ca & 3u) * 8u)) & 0xFFu;
+      dBn = float(unpackHalf2x16(wd).x);
+      qBn = q8 >= 0x80u ? int(q8) - 256 : int(q8);
+    }
+    if (hAc)
+      accA = fma(X[xo + kAc], to_bf16(float(qAc) * dAc), accA);
+    if (hBc)
+      accB = fma(X[xo + kBc], to_bf16(float(qBc) * dBc), accB);
+    kAc = kAn; dAc = dAn; qAc = qAn; hAc = hAn;
+    kBc = kBn; dBc = dBn; qBc = qBn; hBc = hBn;
+  }
+  // Baseline level s=64 (sums[t] += sums[t+64]) is stream A += stream B
+  // in this lane; levels s=32..1 are the 64-wide XOR butterfly.
+  float acc = accA + accB;
+  for (uint s = 32u; s > 0u; s >>= 1u)
+    acc += subgroupShuffleXor(acc, s);
+  if (tid == 0u)
+    Y[t * p.N + n] = acc + (p.use_bias != 0u ? bf16(uint(B[n])) : 0.0);
+}

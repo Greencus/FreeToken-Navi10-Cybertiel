@@ -1,0 +1,61 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+// Q8_0 GEMV over the GGUF file's OWN packed bytes (FTV_Q80_GGUF_VARIANT=
+// pa): pt's slim 2-load fetch + fast reduce with the per-element address
+// math strength-reduced BY HAND (see linear_q80gguf_wpa_f32.comp): only
+// `+= 34` on two running dword pointers + `+= 128` on the X pointer per
+// iteration.  Same values, same fma order -> bit-identical to ref.
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer QBuf { uint Q[]; };
+layout(std430,binding=1) readonly buffer BBuf { uint16_t B[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) writeonly buffer YBuf { float Y[]; };
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint use_bias; uint rowstride;
+} p;
+shared float sums[128];
+
+float bf16(uint bits) { return uintBitsToFloat(bits << 16u); }
+
+// Round f32 -> bf16, round-to-nearest-even (same as torch.bfloat16()).
+float to_bf16(float v) {
+  uint f = floatBitsToUint(v);
+  f = f + 0x7FFFu + ((f >> 16u) & 1u);   // RNE: half-ulp bias + lsb
+  return uintBitsToFloat(f & 0xFFFF0000u);
+}
+
+void main() {
+  uint n = gl_WorkGroupID.x, t = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+  if (n >= p.N || t >= p.T) return;
+  float acc = 0.0;
+  uint wb = n * p.rowstride, xo = t * p.K;
+  // k = tid + 128m: block = (tid>>5) + 4m, in-block byte = tid & 31 -
+  // both fixed across iterations, so only the dword pointers advance.
+  uint b0 = wb + (tid >> 5) * 34u;
+  uint c0 = b0 + 2u + (tid & 31u);
+  uint qd = b0 >> 2u, cd = c0 >> 2u;
+  uint shd = (b0 & 3u) * 8u, shc = (c0 & 3u) * 8u;
+  uint xp = xo + tid, k = tid;
+  for (uint m = 0u; (m << 7u) < p.K; ++m) {
+    if (k < p.K) {
+      uint wd = (Q[qd] >> shd) & 0xFFFFu;
+      uint q8 = (Q[cd] >> shc) & 0xFFu;
+      float d = float(unpackHalf2x16(wd).x);
+      int q = q8 >= 0x80u ? int(q8) - 256 : int(q8);
+      acc = fma(X[xp], to_bf16(float(q) * d), acc);
+    }
+    qd += 34u; cd += 34u; xp += 128u; k += 128u;
+  }
+  sums[tid] = acc;
+  barrier();
+  if (tid < 64u) {
+    acc = acc + sums[tid + 64u];                // level s=64 (cross-wave)
+    for (uint s = 32u; s > 0u; s >>= 1u)
+      acc += subgroupShuffleXor(acc, s);        // levels s=32..1
+    if (tid == 0u)
+      Y[t * p.N + n] = acc + (p.use_bias != 0u ? bf16(uint(B[n])) : 0.0);
+  }
+}

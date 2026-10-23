@@ -1,0 +1,134 @@
+#version 450
+// attn_qwen35_prep_f32.comp — Qwen3.5-MoE full-attention Q/K prep (decode,
+// FTV_GGUF_GPU_ATTN). Per-row zero-centered RMSNorm
+//     y = x * rsqrt(mean(x^2) + eps) * (1 + w)
+// (the Qwen3.5 norm-weight contract, same as rmsnorm_1pw) plus partial
+// RoPE (GPT-NeoX halves over the first `rotary` dims, cos/sin row `pos`),
+// then the KV append into the capacity-strided device cache and the
+// writeback staging row the host mirror copies from.
+//
+// One workgroup of 256 threads per row; dispatch gx = hq + hkv:
+//   wg <  hq : fused qg row (wg * 2 * hd) - ONLY the query half
+//              [base, base+hd) is normed+roped in place; the gate half must
+//              survive verbatim (the forward kernel reads it afterwards).
+//   wg >= hq : k row (wkg = wg - hq) * hd, same norm+rope, then writes
+//              kcache/vcache at (wkg * capacity + pos) and staging.
+//
+// In-place rope has NO cross-thread read: thread t < rotary/2 owns its whole
+// rotation pair (t, t + rotary/2) and reads/scales both elements before
+// writing either; threads [rotary/2, rotary) are idle in pass 2 (their
+// elements belong to the pair owner); threads >= rotary scale their single
+// pass-through element. Shared memory holds ONLY the single-writer
+// sum(x^2) reduction (the rmsnorm_1pw tree pattern - the proven-safe shape
+// on this RADV/Navi10 stack).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer BufQg { float qg[]; };      // rmw (query half)
+layout(std430, binding = 1) buffer BufK { float k[]; };        // rmw (norm+rope)
+layout(std430, binding = 2) readonly buffer BufV { float v[]; };      // raw v rows
+layout(std430, binding = 3) writeonly buffer BufKC { float kcache[]; };
+layout(std430, binding = 4) writeonly buffer BufVC { float vcache[]; };
+layout(std430, binding = 5) writeonly buffer BufStage { float stage[]; };
+layout(std430, binding = 6) readonly buffer BufCos { float cos_t[]; };
+layout(std430, binding = 7) readonly buffer BufSin { float sin_t[]; };
+layout(std430, binding = 8) readonly buffer BufQN { float qkn[]; };  // [qn | kn]
+
+layout(push_constant) uniform Params {
+    uint pos;
+    uint capacity;
+    uint hq;
+    uint hkv;
+    uint hd;
+    uint rotary;
+    float eps;
+} p;
+
+shared float partial[256];
+
+void main() {
+    const uint wg    = gl_WorkGroupID.x;
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint hd    = p.hd;
+    const uint rot   = p.rotary;
+    const uint half_r = rot / 2u;
+
+    const bool is_q = (wg < p.hq);
+    uint wkg = 0u;
+    uint base;
+    uint wbase;
+    if (is_q) {
+        base  = wg * 2u * hd;
+        wbase = 0u;
+    } else {
+        wkg  = wg - p.hq;
+        base = wkg * hd;
+        wbase = hd;
+    }
+
+    // Pass 1: partial sum(x^2) over this row (one element per thread).
+    float xv = is_q ? qg[base + tid] : k[base + tid];
+    partial[tid] = xv * xv;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        barrier();
+    }
+    const float scale = inversesqrt(partial[0] / float(hd) + p.eps);
+
+    // Pass 2: scale * (1 + w), then (for rot-range) the pair rotation.
+    const float w_d = qkn[wbase + tid];
+    if (tid < half_r) {
+        // Pair owner: both elements (tid, tid + half_r) read BEFORE writes.
+        const float w_e = qkn[wbase + tid + half_r];
+        float x1, x2;
+        if (is_q) {
+            x1 = qg[base + tid];
+            x2 = qg[base + tid + half_r];
+        } else {
+            x1 = k[base + tid];
+            x2 = k[base + tid + half_r];
+        }
+        x1 = x1 * scale * (1.0 + w_d);
+        x2 = x2 * scale * (1.0 + w_e);
+        const float c = cos_t[p.pos * rot + tid];
+        const float s = sin_t[p.pos * rot + tid];
+        const float y1 = x1 * c - x2 * s;
+        const float y2 = x2 * c + x1 * s;
+        if (is_q) {
+            qg[base + tid] = y1;
+            qg[base + tid + half_r] = y2;
+        } else {
+            k[base + tid] = y1;
+            k[base + tid + half_r] = y2;
+            // KV append, POSITION-major [max_len, hkv, hd] - the host
+            // mirror's layout, so _attn_gpu_ensure's prefix upload and the
+            // host writeback share the addressing. Staging stays kv-blocked
+            // ([k: kv0,kv1 | v: kv0,kv1]).
+            const uint row = (p.pos * p.hkv + wkg) * hd;
+            kcache[row + tid] = y1;
+            kcache[row + tid + half_r] = y2;
+            vcache[row + tid] = v[wkg * hd + tid];
+            vcache[row + tid + half_r] = v[wkg * hd + tid + half_r];
+            const uint sbase = wkg * hd;
+            stage[sbase + tid] = y1;
+            stage[sbase + tid + half_r] = y2;
+            stage[p.hkv * hd + sbase + tid] = v[wkg * hd + tid];
+            stage[p.hkv * hd + sbase + tid + half_r] = v[wkg * hd + tid + half_r];
+        }
+    } else if (tid < rot) {
+        // Idle: elements [half_r, rot) belong to the pair owner above.
+    } else {
+        float x1 = is_q ? qg[base + tid] : k[base + tid];
+        x1 = x1 * scale * (1.0 + w_d);
+        if (is_q) {
+            qg[base + tid] = x1;
+        } else {
+            k[base + tid] = x1;
+            const uint row = (p.pos * p.hkv + wkg) * hd;
+            kcache[row + tid] = x1;
+            vcache[row + tid] = v[wkg * hd + tid];
+            stage[wkg * hd + tid] = x1;
+            stage[p.hkv * hd + wkg * hd + tid] = v[wkg * hd + tid];
+        }
+    }
+}

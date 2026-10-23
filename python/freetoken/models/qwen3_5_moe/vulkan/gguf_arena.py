@@ -62,7 +62,12 @@ from typing import Any
 
 import torch
 
-from freetoken.models.gguf.packed import packed_gate_up_expert, packed_tensor
+from freetoken.models.gguf.packed import (
+    packed_expert,
+    packed_gate_up_expert,
+    packed_tensor,
+    packed_view_tensor,
+)
 
 from .gguf_provider import ExpertBank
 from .nvfp4_resident import _translate
@@ -78,7 +83,24 @@ from .nvfp4_resident import _translate
 # LRU + pinned dense > 7.5 GB on the 8 GB card).  Cap, do not delete: the
 # sequential fallback keeps a warm working set and the LRU machinery
 # (_cache_touch/_pool_get) keeps its invariants.
-_KQ_LRU_CAP_MB = 512
+#
+# The cap is a VRAM TRADE: every MiB here is a MiB the arena cannot use.
+# FTV_GGUF_LRU_CAP_MB tunes it (0 = the LRU holds nothing; the arena is then
+# the only expert store, which is what a long decode wants - the LRU is a
+# prefill/sequential fallback, not part of the decode path).
+_KQ_LRU_CAP_MB_DEFAULT = 512
+
+
+def _kq_lru_cap_mb() -> int:
+    """LRU cap in MiB (env FTV_GGUF_LRU_CAP_MB, default 512)."""
+    raw = os.environ.get("FTV_GGUF_LRU_CAP_MB", "").strip()
+    if not raw:
+        return _KQ_LRU_CAP_MB_DEFAULT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _KQ_LRU_CAP_MB_DEFAULT
+
 
 _KQ_FUSED_TYPES = ("q4_k", "q5_k")
 
@@ -116,6 +138,13 @@ class GgufArenaMixin:
         self._kq_slot_wd_b: list[int] = []   # per-layer down slot stride (B)
         self._kq_layer_ok: dict[int, bool] = {}
         self._kq_layer_c: dict[int, tuple[int, int, int, int]] = {}
+        self._kq_zc_ok: dict[int, bool] = {}   # per-layer zero-copy upload
+        # (layer, expert) -> the zero-copy (gate, up, down) mmap views.  The
+        # views are stable windows into the GGUF mmap, so they are derived
+        # ONCE per expert instead of on every upload (the derivation cost
+        # ~6.6 ms/token at ~330 uploads/token).
+        self._kq_slab_cache: dict[
+            tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._moe_pref: dict[int, tuple[list[int], list[float]]] = {}
         if not (self._packed_kq and self._gguf_batched):
             return
@@ -308,20 +337,35 @@ class GgufArenaMixin:
         Runs only OUTSIDE an open batch and only on the arena path: the
         arena never stores its experts in ``_exp_cache``, so anything in the
         cache or pool is prefill's or a sequential arm's dead weight.
+
+        Hot-set-pinned entries are EXEMPT.  A blanket ``clear()`` here used
+        to wipe all 640 pinned entries on the first batched-decode token
+        (``_hotset_keys`` stayed populated, so nothing was ever re-pinned
+        and ``test_eviction_never_touches_pinned`` failed).  The pin is
+        budget-carved from the same expert budget, so keeping it cannot
+        oversubscribe VRAM.
         """
         ext = self.ext
         freed = 0
-        for entry in list(self._exp_cache.values()):
+        pinned = getattr(self, "_hotset_keys", set())
+        arena_keys = getattr(self, "_arena_keys", set())
+        for key, entry in list(self._exp_cache.items()):
+            if key in pinned:
+                continue
             h_w, h_s = entry[0], entry[1]
-            for h in (h_w, h_s):
-                if h:
-                    try:
-                        ext.free_resident(h)
-                    except RuntimeError:
-                        pass
-            freed += int(entry[3])
-        self._exp_cache.clear()
-        self._exp_cache_bytes = 0
+            if key in arena_keys:
+                self._arena_drop(key)
+            else:
+                for h in (h_w, h_s):
+                    if h:
+                        try:
+                            ext.free_resident(h)
+                        except RuntimeError:
+                            pass
+            freed += int(entry[2])
+            self._exp_cache.pop(key, None)
+            self._exp_cache_bytes = max(0, self._exp_cache_bytes - int(entry[2]))
+            self._exp_freq.pop(key, None)
         for key, lst in list(self._exp_pool.items()):
             for h_w, h_s in lst:
                 for h in (h_w, h_s):
@@ -363,7 +407,7 @@ class GgufArenaMixin:
         # _exp_cache_budget is BYTES (cache_mb * 1024 * 1024 at init);
         # capping with the raw MiB constant would make every _cache_put
         # self-evict and free the handle it just uploaded.
-        cap_bytes = _KQ_LRU_CAP_MB * 2**20
+        cap_bytes = _kq_lru_cap_mb() * 2**20
         if self._exp_cache_budget > cap_bytes:
             self._exp_cache_budget = cap_bytes
         self._kq_arena_alloc_all()
@@ -387,7 +431,11 @@ class GgufArenaMixin:
     # ------------------------------------------------------------------
     def _kq_pack_gu(self, gate_mat: ExpertBank, up_mat: ExpertBank,
                     expert: int) -> torch.Tensor:
-        """Stacked gate+up packed bytes (cached in the host pack cache)."""
+        """Stacked gate+up packed bytes (cached in the host pack cache).
+
+        The OLD concat+copy upload payload - kept as the loud per-layer
+        fallback of the zero-copy path (``_kq_slabs_zc``), not its default.
+        """
         key = (id(gate_mat), id(up_mat), expert)
 
         def build():
@@ -405,7 +453,11 @@ class GgufArenaMixin:
         return packed
 
     def _kq_pack_dn(self, down_mat: ExpertBank, expert: int) -> torch.Tensor:
-        """Down packed bytes (cached in the host pack cache)."""
+        """Down packed bytes (cached in the host pack cache).
+
+        The OLD copy payload - kept as the loud per-layer fallback of the
+        zero-copy path (``_kq_slabs_zc``), not its default.
+        """
         key = (id(down_mat), expert)
 
         def build():
@@ -415,6 +467,54 @@ class GgufArenaMixin:
 
         packed, _scales, _hit = self._host_pack_get(key, build)
         return packed
+
+    def _kq_slabs_zc(
+        self, i: int, gm: ExpertBank, um: ExpertBank, dm: ExpertBank,
+        expert: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """ZERO-COPY (gate, up, down) mmap views, or None (layer falls back).
+
+        Each tensor shares the GGUF mmap's bytes (``packed_view_tensor``),
+        so the only host copy on the upload path is the extension's staging
+        memcpy - the concat+copy payload this replaces read the same bytes
+        three times (mmap -> np.concatenate -> torch .copy()).  The shapes
+        are re-checked against the banks the slot strides were sized from:
+        a drift would misaddress the slot's rows, so that layer loudly
+        reverts (once) to the concat+copy path instead of uploading
+        misaligned bytes.
+        """
+        if not self._kq_zc_ok.get(i, True):
+            return None
+        cache = self._kq_slab_cache
+        key = (i, expert)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        layer = gm.layer
+        g = packed_expert(self.tensors.index, f"blk.{layer}.ffn_gate_exps.weight",
+                          expert)
+        u = packed_expert(self.tensors.index, f"blk.{layer}.ffn_up_exps.weight",
+                          expert)
+        d = self.tensors.expert_packed(layer, dm.proj, expert)
+        if not (g.shape == (gm.rows, gm.row_bytes)
+                and u.shape == (um.rows, um.row_bytes)
+                and d.shape == (dm.rows, dm.row_bytes)
+                and gm.row_bytes == um.row_bytes):
+            print(
+                f"GGUF arena layer {i}: zero-copy slab drift (gate {g.shape} "
+                f"vs ({gm.rows}, {gm.row_bytes}), up {u.shape} vs "
+                f"({um.rows}, {um.row_bytes}), down {d.shape} vs "
+                f"({dm.rows}, {dm.row_bytes}) row_bytes "
+                f"{gm.row_bytes}/{um.row_bytes}); falling back to the "
+                "concat+copy upload for this layer", flush=True)
+            self._kq_zc_ok[i] = False
+            return None
+        out = (packed_view_tensor(g), packed_view_tensor(u),
+               packed_view_tensor(d))
+        if len(cache) >= 16384:
+            cache.clear()
+        cache[key] = out
+        return out
 
     def _kq_assign_routed(self, i: int, elist: list[int]) -> list[tuple[int, int]]:
         """Pin loop: every routed expert owns a slot; return the misses.
@@ -458,6 +558,13 @@ class GgufArenaMixin:
                            *, async_: bool) -> int:
         """Write the packed content of ``pending`` (expert, slot) pairs.
 
+        Content uploads are ZERO-COPY: three mmap-view slabs per expert
+        (gate at the slot base, up at base + N*row_bytes - the exact bytes
+        ``np.concatenate`` produced, which the fused gateup shader reads as
+        rows 0..N-1 / N..2N-1 of the slot - and down in the down bank).
+        A layer whose slab shapes drift from the banks falls back to the
+        old concat+copy payload (``_kq_pack_gu``/``_kq_pack_dn``) loudly.
+
         ``async_=True`` emits queue-2 copies OUTSIDE the open batch and
         returns the flush cookie (-1 when nothing is pending); the consumer
         batch records ``batch_cross_barrier`` at ``batch_begin`` and submits
@@ -480,12 +587,23 @@ class GgufArenaMixin:
                     f"layer {i}: pending (expert {e}, slot {sidx}) is STALE "
                     f"(map has {self._arena_map[i].get(e)}); refusing a "
                     "stale-slot content write")
-            fp = self._kq_pack_gu(gm, um, e)
-            dq = self._kq_pack_dn(dm, e)
-            handles += [self._arena_wf[i], self._arena_wd[i]]
-            tensors += [fp, dq]
-            offsets += [sidx * self._kq_slot_wf_b[i],
-                        sidx * self._kq_slot_wd_b[i]]
+            slabs = self._kq_slabs_zc(i, gm, um, dm, e)
+            if slabs is not None:
+                gt, ut, dt = slabs
+                slot_base = sidx * self._kq_slot_wf_b[i]
+                handles += [self._arena_wf[i], self._arena_wf[i],
+                            self._arena_wd[i]]
+                tensors += [gt, ut, dt]
+                offsets += [slot_base,
+                            slot_base + gm.rows * gm.row_bytes,
+                            sidx * self._kq_slot_wd_b[i]]
+            else:
+                fp = self._kq_pack_gu(gm, um, e)
+                dq = self._kq_pack_dn(dm, e)
+                handles += [self._arena_wf[i], self._arena_wd[i]]
+                tensors += [fp, dq]
+                offsets += [sidx * self._kq_slot_wf_b[i],
+                            sidx * self._kq_slot_wd_b[i]]
         ext = self.ext
         if async_:
             for h, t, o in zip(handles, tensors, offsets):

@@ -205,10 +205,21 @@ class MtpHead:
         # nextn-specific weights: eh_proj pins like any dense matrix, the
         # three nextn norms stay host tensors (they are applied in torch).
         self.eh_stem = f"language_model.model.layers.{MTP_LAYER}.mtp.eh_proj"
-        eh = tensors._matrix(
-            tensors._t(f"blk.{MTP_LAYER}.nextn.eh_proj"), torch.bfloat16
-        )
-        model.pinned[_translate(self.eh_stem)] = _GgufPinned(model.ext, eh)
+        packed_eh = None
+        if getattr(model, "_dense_q80", False):
+            packed_eh = tensors.packed_matrix(
+                tensors._t(f"blk.{MTP_LAYER}.nextn.eh_proj")
+            )
+        if packed_eh is not None:
+            slab, _k = packed_eh
+            model.pinned[_translate(self.eh_stem)] = _GgufPinned(
+                model.ext, slab, packed=True
+            )
+        else:
+            eh = tensors._matrix(
+                tensors._t(f"blk.{MTP_LAYER}.nextn.eh_proj"), torch.bfloat16
+            )
+            model.pinned[_translate(self.eh_stem)] = _GgufPinned(model.ext, eh)
         self.enorm = _nextn_norm(tensors, "enorm")
         self.hnorm = _nextn_norm(tensors, "hnorm")
         self.shared_head_norm = _nextn_norm(tensors, "shared_head_norm")

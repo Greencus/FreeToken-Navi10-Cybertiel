@@ -1,0 +1,44 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Q8_0 twin of linear_bf16_resident_f32 (FTV_Q80 dense shadow): same
+// 128-lane workgroup per (row, token), same lane stride (k = tid, tid +
+// 128, ...) and same tree reduce, but the weight fetch decodes the
+// 36-byte slab written by quant_bf16_q80 - half the DRAM bytes of the
+// BF16 path.  Block layout: byte 0 = fp16 scale d, bytes 4..35 = 32
+// sign-extended int8 codes; dequant = float(q) * float(d).
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer QBuf { uint Q[]; };
+layout(std430,binding=1) readonly buffer BBuf { uint16_t B[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) writeonly buffer YBuf { float Y[]; };
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint use_bias; uint rowstride;
+} p;
+shared float sums[128];
+
+float bf16(uint bits) { return uintBitsToFloat(bits << 16u); }
+
+void main() {
+  uint n = gl_WorkGroupID.x, t = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+  if (n >= p.N || t >= p.T) return;
+  float acc = 0.0;
+  uint wb = n * p.rowstride / 4u, xo = t * p.K;
+  for (uint k = tid; k < p.K; k += 128u) {
+    uint w0 = wb + (k >> 5u) * 9u;
+    float d = float(unpackHalf2x16(Q[w0]).x);
+    uint qword = Q[w0 + 1u + ((k & 31u) >> 2u)];
+    uint q8 = (qword >> ((k & 3u) * 8u)) & 0xFFu;
+    int q = q8 >= 0x80u ? int(q8) - 256 : int(q8);  // sign-extend int8
+    acc = fma(X[xo + k], float(q) * d, acc);
+  }
+  sums[tid] = acc;
+  barrier();
+  for (uint s = 64u; s > 0u; s >>= 1u) {
+    if (tid < s) sums[tid] += sums[tid + s];
+    barrier();
+  }
+  if (tid == 0u)
+    Y[t * p.N + n] = sums[0] + (p.use_bias != 0u ? bf16(uint(B[n])) : 0.0);
+}

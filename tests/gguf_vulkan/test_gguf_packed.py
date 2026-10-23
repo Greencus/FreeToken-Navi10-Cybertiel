@@ -29,6 +29,7 @@ from freetoken.models.gguf.packed import (
     packed_expert_info,
     packed_gate_up_expert,
     packed_tensor,
+    packed_view_tensor,
 )
 from freetoken.models.gguf.reader import gguf_tensor_index
 from freetoken.third_party.gguf import GGMLQuantizationType
@@ -137,6 +138,74 @@ def test_packed_tensor_is_upload_ready():
 def torch_uint8():
     import torch
     return torch.uint8
+
+
+@requires_gguf
+def test_packed_view_tensor_is_zero_copy():
+    """packed_view_tensor must SHARE the mmap bytes (no host copy)."""
+    index = gguf_tensor_index(GGUF)
+    slab = packed_expert(index, "blk.15.ffn_gate_exps.weight", 11)
+    t = packed_view_tensor(slab)
+    assert t.dtype == torch.uint8 and t.is_contiguous()
+    assert t.numel() == slab.size
+    assert np.shares_memory(t.numpy(), slab)
+    assert t.numpy().tobytes() == slab.tobytes()
+    # the source view is read-only (mmap); the view tensor shares it, so
+    # it must be treated as read-only too (the ext only reads its pointer)
+    assert not slab.flags.writeable
+    with pytest.raises(ValueError):
+        packed_view_tensor(slab.astype(np.float32))
+
+
+@requires_gguf
+def test_arena_zero_copy_layout_matches_concat_upload():
+    """The arena's three-slab upload must reproduce the concat payload bytes
+    at every byte the fused gateup shader reads from the slot.
+
+    Old path: np.concatenate([gate, up]) -> packed_tensor copy -> one
+    upload at the slot base. New path: gate and up as separate zero-copy
+    slabs at ``base`` and ``base + N*row_bytes`` - the slot's row layout is
+    [gate rows 0..N-1][up rows N..2N-1] either way, but a wrong offset or
+    a non-contiguous view would put different bytes on the device.
+    """
+    index = gguf_tensor_index(GGUF)
+    for layer in (Q5_LAYER, Q4_LAYER):
+        g = packed_expert(index, f"blk.{layer}.ffn_gate_exps.weight", 5)
+        u = packed_expert(index, f"blk.{layer}.ffn_up_exps.weight", 5)
+        d = packed_expert(index, f"blk.{layer}.ffn_down_exps.weight", 5)
+        rb = g.shape[1]
+        N = g.shape[0]
+        # down is a separate bank (K = gate rows, not cols) with its own
+        # row bytes - the arena sizes its slot stride from dm.row_bytes
+        assert u.shape == (N, rb) and d.shape[1] != rb
+
+        # old payload: one concat copy per (gate+up) slot, one per down
+        gu_old = packed_tensor(packed_gate_up_expert(index, layer, 5))
+        dn_old = packed_tensor(d)
+
+        # new payload: three zero-copy views
+        gt, ut, dt = (packed_view_tensor(s) for s in (g, u, d))
+
+        gu_stride = (g.shape[0] + u.shape[0]) * rb   # the arena's slot stride
+        dn_stride = d.shape[0] * d.shape[1]
+        # host mirrors of the two arena buffers, written at the upload offsets
+        wf = np.zeros(gu_stride, np.uint8)
+        wd = np.zeros(dn_stride, np.uint8)
+        wf[: gt.numel()] = gt.numpy().reshape(-1)
+        wf[N * rb: N * rb + ut.numel()] = ut.numpy().reshape(-1)
+        wd[: dt.numel()] = dt.numpy().reshape(-1)
+
+        # what the old upload put in the same slot bytes
+        wf_ref = np.zeros(gu_stride, np.uint8)
+        wd_ref = np.zeros(dn_stride, np.uint8)
+        wf_ref[: gu_old.numel()] = gu_old.numpy().reshape(-1)
+        wd_ref[: dn_old.numel()] = dn_old.numpy().reshape(-1)
+
+        assert np.array_equal(wf, wf_ref), f"layer {layer}: gateup slot bytes differ"
+        assert np.array_equal(wd, wd_ref), f"layer {layer}: down slot bytes differ"
+        # and the row view the shader uses (rows x row_bytes) is identical
+        assert np.array_equal(wf.reshape(2 * N, rb),
+                              np.concatenate([g, u], axis=0))
 
 
 @requires_gguf

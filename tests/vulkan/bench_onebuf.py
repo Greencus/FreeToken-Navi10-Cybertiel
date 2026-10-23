@@ -119,23 +119,22 @@ def run_onebuf(model, ext, tokens: int) -> dict:
         for _ in range(tokens):
             token = int(_LOGITS["v"].argmax().item())
             swallowed["begin"] = swallowed["submit"] = 0
+            state["open"] = False          # each token = one fresh buffer
             t0 = time.perf_counter()
             _LOGITS["v"] = model.decode_step_batched(
                 model.embed_row(token), _POS["v"])
             walls.append(time.perf_counter() - t0)
             _POS["v"] += 1
             model._seq_len = _POS["v"]
+            # close THIS token's buffer and time its single fence while
+            # the patch is still installed (so a nested begin/submit can
+            # never slip through between walk and submit)
+            if state["open"]:
+                t0 = time.perf_counter()
+                real_submit()
+                fences.append(time.perf_counter() - t0)
     finally:
         ext.batch_begin, ext.batch_submit = real_begin, real_submit
-    # Each token left ONE open command buffer: submit it now and time the
-    # single fence (one per token - the buffers are sequential).
-    # NOTE: after the first token the host walk ran on stale readbacks, so
-    # only the FIRST token's fence is a faithful "same work, one buffer"
-    # measurement; later tokens still exercise the same dispatch count.
-    for _ in range(tokens):
-        t0 = time.perf_counter()
-        real_submit()
-        fences.append(time.perf_counter() - t0)
     return {
         "arm": "onebuf",
         "wall_ms_median": _median([w * 1e3 for w in walls]),
@@ -161,9 +160,15 @@ def main() -> int:
     ap.add_argument("--tokens", type=int, default=4)
     ap.add_argument("--max-len", type=int, default=4096)
     ap.add_argument("--json", default=None)
+    ap.add_argument("--prefetch", action="store_true",
+                    help="keep FTV_GGUF_PREFETCH=1 (default off here: "
+                         "queue-2 uploads require a closed main batch, "
+                         "which the onebuf arm keeps open)")
     args = ap.parse_args()
     if not args.model or not pathlib.Path(args.model).is_file():
         raise SystemExit("set --model or FREETOKEN_TEST_MODEL_GGUF")
+    if not args.prefetch:
+        os.environ["FTV_GGUF_PREFETCH"] = "0"
 
     from freetoken.kernel import vulkan as vk
     from freetoken.models.qwen3_5_moe.vulkan import ResidentGGUF

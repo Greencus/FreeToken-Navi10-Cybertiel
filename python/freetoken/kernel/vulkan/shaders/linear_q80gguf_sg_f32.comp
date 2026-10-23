@@ -1,0 +1,71 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+// Q8_0 GEMV over the GGUF file's OWN packed bytes (FTV_DENSE_Q80),
+// vectorized fetch (FTV_Q80_GGUF_VARIANT=sg).  The reference byte-gather
+// pays 3 dword loads per element: 2 byte_at()s rebuild the block's fp16
+// scale in EVERY one of the 32 threads of the block (they all load the
+// same dword twice).  Here each lane loads only its own code dword (1
+// load) and lane 0 / lane 32 of each wave reads its half's block scale
+// once, shared by subgroupBroadcast with STATIC source lanes - the ids
+// are 0u / 32u, so no dynamic-id broadcast, and the Wave32 fallback still
+// works (each subgroup's lane 0 owns its first half's block).
+// Everything else - the k = tid + 128m loop, the ascending fma order,
+// the to_bf16 RNE round and the tree reduce - is identical to ref, so
+// outputs are bit-identical (block starts are never 3 mod 4, 34*b mod 4
+// is 0 or 2, so d's two bytes never straddle a dword).
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer QBuf { uint Q[]; };
+layout(std430,binding=1) readonly buffer BBuf { uint16_t B[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) writeonly buffer YBuf { float Y[]; };
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint use_bias; uint rowstride;
+} p;
+shared float sums[128];
+
+float bf16(uint bits) { return uintBitsToFloat(bits << 16u); }
+
+// Round f32 -> bf16, round-to-nearest-even (same as torch.bfloat16()).
+float to_bf16(float v) {
+  uint f = floatBitsToUint(v);
+  f = f + 0x7FFFu + ((f >> 16u) & 1u);   // RNE: half-ulp bias + lsb
+  return uintBitsToFloat(f & 0xFFFF0000u);
+}
+
+void main() {
+  uint n = gl_WorkGroupID.x, t = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+  if (n >= p.N || t >= p.T) return;
+  float acc = 0.0;
+  uint wb = n * p.rowstride, xo = t * p.K;
+  uint sl = gl_SubgroupInvocationID;
+  for (uint k = tid; k < p.K; k += 128u) {
+    uint bs = wb + (k >> 5u) * 34u;             // block base, byte addr
+    // block scale d: only the half's owning lane loads it, both static
+    // broadcasts run unconditionally, the select picks the own half.
+    float dsrc = 0.0;
+    if ((sl & 31u) == 0u) {
+      uint wd = (Q[bs >> 2u] >> ((bs & 3u) * 8u)) & 0xFFFFu;
+      dsrc = float(unpackHalf2x16(wd).x);
+    }
+    float dA = subgroupBroadcast(dsrc, 0u);
+    float dB = subgroupBroadcast(dsrc, 32u);
+    float d = (sl & 32u) != 0u ? dB : dA;
+    // this lane's code byte (1 dword load, byte extract)
+    uint ca = bs + 2u + (k & 31u);
+    uint q8 = (Q[ca >> 2u] >> ((ca & 3u) * 8u)) & 0xFFu;
+    int q = q8 >= 0x80u ? int(q8) - 256 : int(q8);  // sign-extend int8
+    acc = fma(X[xo + k], to_bf16(float(q) * d), acc);
+  }
+  sums[tid] = acc;
+  barrier();
+  for (uint s = 64u; s > 0u; s >>= 1u) {
+    if (tid < s) sums[tid] += sums[tid + s];
+    barrier();
+  }
+  if (tid == 0u)
+    Y[t * p.N + n] = sums[0] + (p.use_bias != 0u ? bf16(uint(B[n])) : 0.0);
+}

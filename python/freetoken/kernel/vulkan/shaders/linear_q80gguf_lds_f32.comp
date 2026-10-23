@@ -1,0 +1,89 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Q8_0 GEMV over the GGUF file's OWN packed bytes (FTV_DENSE_Q80),
+// staged-segment fetch (FTV_Q80_GGUF_VARIANT=lds).  One iteration
+// (k = tid + 128m) touches exactly 4 blocks = 136 contiguous bytes, so the
+// whole segment is loaded ONCE cooperatively (34 dword loads for 128
+// lanes instead of ref's 384) into a ping-pong LDS buffer; every lane then
+// extracts its code byte and its block's fp16 scale from LDS.  One workgroup
+// barrier per iteration (double-buffered: stage m+1 lands in the other
+// half, so compute-m and staging never share a buffer).  The k loop, the
+// ascending fma order, the to_bf16 RNE round and the tree reduce are
+// identical to ref -> bit-identical outputs.  Loads stay dword-granular:
+// block starts are never 3 mod 4, so d's two bytes never straddle a dword.
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer QBuf { uint Q[]; };
+layout(std430,binding=1) readonly buffer BBuf { uint16_t B[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) writeonly buffer YBuf { float Y[]; };
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint use_bias; uint rowstride;
+} p;
+shared float sums[128];
+// One 4-block segment = 136 B; an odd row base shifts the staging start
+// by 0 or 2 bytes, so 35 dwords cover the worst case.
+shared uint seg[2][35];
+
+float bf16(uint bits) { return uintBitsToFloat(bits << 16u); }
+
+// Round f32 -> bf16, round-to-nearest-even (same as torch.bfloat16()).
+float to_bf16(float v) {
+  uint f = floatBitsToUint(v);
+  f = f + 0x7FFFu + ((f >> 16u) & 1u);   // RNE: half-ulp bias + lsb
+  return uintBitsToFloat(f & 0xFFFF0000u);
+}
+
+void main() {
+  uint n = gl_WorkGroupID.x, t = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+  if (n >= p.N || t >= p.T) return;
+  float acc = 0.0;
+  uint wb = n * p.rowstride, xo = t * p.K;
+  uint blocks = p.K >> 5u;
+  uint iters = (blocks + 3u) >> 2u;
+  // Pre-stage segment 0 (stage: nbytes = the segment's real byte count,
+  // dword-granular fetch from the row's aligned base).
+  {
+    uint seg0 = wb;
+    uint nbytes = 34u * min(4u, blocks);
+    uint base = seg0 & ~3u;
+    uint o = seg0 - base;
+    uint nd = (o + nbytes + 3u) / 4u;
+    for (uint i = tid; i < nd; i += 128u)
+      seg[0][i] = Q[(base >> 2u) + i];
+  }
+  barrier();
+  for (uint m = 0u; m < iters; ++m) {
+    uint k = tid + (m << 7u);
+    if (k < p.K) {
+      uint si = m & 1u;
+      uint o = (wb + (m << 7u) + (m << 3u)) & 3u;   // (wb + 136m) % 4
+      uint gd = o + (tid >> 5u) * 34u;              // block-scale byte
+      uint wd = (seg[si][gd >> 2u] >> ((gd & 3u) * 8u)) & 0xFFFFu;
+      float d = float(unpackHalf2x16(wd).x);
+      uint gq = gd + 2u + (tid & 31u);              // code byte
+      uint q8 = (seg[si][gq >> 2u] >> ((gq & 3u) * 8u)) & 0xFFu;
+      int q = q8 >= 0x80u ? int(q8) - 256 : int(q8);  // sign-extend int8
+      acc = fma(X[xo + k], to_bf16(float(q) * d), acc);
+    }
+    if (m + 1u < iters) {
+      uint seg0 = wb + ((m + 1u) << 7u) + ((m + 1u) << 3u);   // +136(m+1)
+      uint nbytes = 34u * min(4u, blocks - ((m + 1u) << 2u));
+      uint base = seg0 & ~3u;
+      uint o = seg0 - base;
+      uint nd = (o + nbytes + 3u) / 4u;
+      for (uint i = tid; i < nd; i += 128u)
+        seg[(m + 1u) & 1u][i] = Q[(base >> 2u) + i];
+      barrier();
+    }
+  }
+  sums[tid] = acc;
+  barrier();
+  for (uint s = 64u; s > 0u; s >>= 1u) {
+    if (tid < s) sums[tid] += sums[tid + s];
+    barrier();
+  }
+  if (tid == 0u)
+    Y[t * p.N + n] = sums[0] + (p.use_bias != 0u ? bf16(uint(B[n])) : 0.0);
+}

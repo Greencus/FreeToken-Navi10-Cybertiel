@@ -1,0 +1,45 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// PROBE: original logic + amax/pack markers at words 8+n / 16+n.
+layout(local_size_x=64) in;
+layout(std430,binding=0) readonly buffer WBuf { uint16_t W[]; };
+layout(std430,binding=1) writeonly buffer QBuf { uint Q[]; };
+layout(push_constant) uniform P { uint N; uint K; uint rowstride; } p;
+
+float bf16(uint bits) { return uintBitsToFloat(bits << 16u); }
+
+void main() {
+  uint n = gl_WorkGroupID.x;
+  if (n >= p.N) return;
+  uint li = gl_LocalInvocationID.x;
+  uint blocks = (p.K + 31u) / 32u;
+  uint wrow = n * p.K;
+  uint qrow = n * p.rowstride / 4u;
+  for (uint b = li; b < blocks; b += 64u) {
+    uint base = wrow + b * 32u;
+    float amax = 0.0;
+    for (uint i = 0u; i < 32u; ++i) {
+      // Block-local bound: `base` already carries the row offset (n*K),
+      // so comparing it against the ROW length K zeroed every row > 0.
+      if (b * 32u + i >= p.K) break;
+      amax = max(amax, abs(bf16(uint(W[base + i]))));
+    }
+    float16_t d16 = float16_t(amax > 0.0 ? amax / 127.0 : 0.0);
+    float d = float(d16);
+    uint wb = qrow + b * 9u;
+    Q[wb] = packHalf2x16(vec2(d, 0.0));
+    uint wq = 0u;
+    for (uint i = 0u; i < 32u; ++i) {
+      int q = 0;
+      if (b * 32u + i < p.K && d > 0.0)
+        q = clamp(int(roundEven(bf16(uint(W[base + i])) / d)), -127, 127);
+      wq |= (uint(q) & 0xFFu) << ((i & 3u) * 8u);
+      if ((i & 3u) == 3u) {
+        Q[wb + 1u + (i >> 2u)] = wq;
+        wq = 0u;
+      }
+    }
+  }
+}

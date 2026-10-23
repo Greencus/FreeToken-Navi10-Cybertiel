@@ -47,6 +47,8 @@ its last row. Q4_K/Q5_K need none.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import torch
 
@@ -209,6 +211,26 @@ def packed_tensor(slab: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(slab).copy())
 
 
+def packed_view_tensor(slab: np.ndarray) -> torch.Tensor:
+    """A ZERO-COPY uint8 torch view of a packed mmap slab (for upload).
+
+    Unlike ``packed_tensor`` nothing is copied: the tensor shares the mmap's
+    bytes, so the extension's staging memcpy is the only host copy on the
+    upload path. The tensor is therefore READ-ONLY - treat it as such. The
+    mmap view is read-only, which torch warns about; the warning is
+    suppressed here because the extension only reads the pointer.
+    """
+    if slab.dtype != np.uint8:
+        raise ValueError(f"packed slab must be uint8, got {slab.dtype}")
+    if not slab.flags.c_contiguous:
+        raise ValueError("packed view slab must be C-contiguous")
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="The given NumPy array is not writable",
+            category=UserWarning)
+        return torch.from_numpy(slab)
+
+
 def packed_expert_bytes(index: dict[str, GgufTensorInfo] | None,
                         tensor: str | GgufTensorInfo,
                         expert: int,
@@ -228,4 +250,5 @@ __all__ = [
     "packed_expert_info",
     "packed_gate_up_expert",
     "packed_tensor",
+    "packed_view_tensor",
 ]

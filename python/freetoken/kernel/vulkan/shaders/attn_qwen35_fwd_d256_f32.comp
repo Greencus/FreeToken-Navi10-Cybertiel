@@ -1,0 +1,136 @@
+#version 450
+// attn_qwen35_fwd_d256_f32.comp — single-query GQA attention over the
+// capacity-strided device KV cache (FTV_GGUF_GPU_ATTN decode lane).
+//
+// The Qwen3.5 variant of flash_attention_gpt_oss_kv_cache: D = 256 with
+// BC = 16 to fit the Ks/Vs LDS pair, Q read from the FUSED qg buffer at
+// q_stride (query half of each 2*hd row), the sigmoid output gate folded
+// in-shader from the gate half, no attention sinks, no sliding window.
+// One workgroup per query head; dispatch gx = hq, S_q = 1 (decode): the
+// softmax runs over kv in [0, pos] - the row prep-appended at `pos` is
+// attended, matching the host reference (_full_attn_host scores[:, :pos+1]).
+//
+// Online softmax is a bit-faithful clone of the gpt_oss flash core
+// (fp32 max/sum renorm, alpha rescale of the accumulator).
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer BufQg { float qg[]; };
+layout(std430, binding = 1) readonly buffer BufKC { float kcache[]; };
+layout(std430, binding = 2) readonly buffer BufVC { float vcache[]; };
+layout(std430, binding = 3) writeonly buffer BufO { float outv[]; };
+
+layout(push_constant) uniform Params {
+    uint pos;      // absolute position of this query row
+    uint capacity; // device cache stride (positions per kv head)
+    uint hq;
+    uint hkv;
+    uint hd;       // 256
+    uint stride;   // qg row stride (2 * hd)
+    float scale;   // 1 / sqrt(hd)
+} p;
+
+const uint BC = 16;
+const uint WG = 128;
+const float NEG_LARGE = -3.4e38;
+
+shared float Ks[BC][256];
+shared float Vs[BC][256];
+shared float qs[256];
+shared float os[256];
+shared float scores[BC];
+shared float sdata[WG];
+shared float m_val;
+shared float l_val;
+
+void main() {
+    const uint head_q = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint hd = p.hd;
+    const uint head_kv = head_q / (p.hq / p.hkv);
+    const uint q_base = head_q * p.stride;    // query half start
+    const uint gate_base = q_base + hd;       // gate half (sigmoid here)
+    const uint o_base = head_q * hd;
+
+    for (uint d = tid; d < hd; d += WG) qs[d] = qg[q_base + d];
+    for (uint d = tid; d < hd; d += WG) os[d] = 0.0;
+    if (tid == 0u) { m_val = NEG_LARGE; l_val = 0.0; }
+    barrier();
+
+    const uint S_kv = p.pos + 1u;
+    const uint nblock = (S_kv + BC - 1u) / BC;
+    for (uint b = 0u; b < nblock; ++b) {
+        const uint k_start = b * BC;
+        const uint blen = min(BC, S_kv - k_start);
+        for (uint i = tid; i < BC * hd; i += WG) {
+            const uint row = i / hd;
+            const uint col = i % hd;
+            const uint g = k_start + row;
+            const bool ok = (row < blen);
+            // POSITION-major [max_len, hkv, hd] - the host mirror's layout
+            // (see the prep shader): element (g, head_kv, col).
+            const uint off = (g * p.hkv + head_kv) * hd + col;
+            Ks[row][col] = ok ? kcache[off] : 0.0;
+            Vs[row][col] = ok ? vcache[off] : 0.0;
+        }
+        barrier();
+
+        if (tid < BC) {
+            if (tid < blen) {
+                float acc = 0.0;
+                for (uint d = 0u; d < hd; ++d) {
+                    acc = fma(qs[d], Ks[tid][d], acc);
+                }
+                scores[tid] = acc * p.scale;
+            } else {
+                scores[tid] = NEG_LARGE;
+            }
+        }
+        barrier();
+
+        // Online softmax renorm (clone of the gpt_oss flash core).
+        sdata[tid] = (tid < BC) ? scores[tid] : NEG_LARGE;
+        barrier();
+        for (uint s = WG / 2u; s > 0u; s >>= 1u) {
+            if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+            barrier();
+        }
+        const float m_block = sdata[0];
+        const float m_new = max(m_val, m_block);
+        const float alpha = exp(m_val - m_new);
+
+        if (tid < BC) {
+            if (tid < blen && scores[tid] > NEG_LARGE * 0.5) {
+                scores[tid] = exp(scores[tid] - m_new);
+            } else {
+                scores[tid] = 0.0;
+            }
+        }
+        barrier();
+
+        sdata[tid] = (tid < BC) ? scores[tid] : 0.0;
+        barrier();
+        for (uint s = WG / 2u; s > 0u; s >>= 1u) {
+            if (tid < s) sdata[tid] += sdata[tid + s];
+            barrier();
+        }
+        const float block_sum = sdata[0];
+        const float l_new = alpha * l_val + block_sum;
+
+        for (uint d = tid; d < hd; d += WG) {
+            float pv = 0.0;
+            for (uint s = 0u; s < BC; ++s) {
+                pv = fma(scores[s], Vs[s][d], pv);
+            }
+            os[d] = alpha * os[d] + pv;
+        }
+
+        if (tid == 0u) { m_val = m_new; l_val = l_new; }
+        barrier();
+    }
+
+    const float inv_l = (l_val > 0.0) ? (1.0 / l_val) : 0.0;
+    for (uint d = tid; d < hd; d += WG) {
+        const float g = 1.0 / (1.0 + exp(-qg[gate_base + d]));
+        outv[o_base + d] = os[d] * inv_l * g;
+    }
+}

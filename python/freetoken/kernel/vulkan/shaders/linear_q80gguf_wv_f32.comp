@@ -1,0 +1,89 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+// Q8_0 GEMV over the GGUF file's OWN packed bytes (FTV_Q80_GGUF_VARIANT=
+// wv): wb with the uniform condition actually UNSWITCHED BY HAND - one
+// whole workgroup takes either the guard-free loop (K % 128 == 0: no k
+// register, no in-bounds test, no branch inside) or the guarded loop, so
+// the fast path keeps only two running dword pointers + X pointer per
+// stream per iteration.  Same values, same fma order -> bit-identical
+// to ref.
+layout(local_size_x=64) in;
+layout(std430,binding=0) readonly buffer QBuf { uint Q[]; };
+layout(std430,binding=1) readonly buffer BBuf { uint16_t B[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) writeonly buffer YBuf { float Y[]; };
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint use_bias; uint rowstride;
+} p;
+
+float bf16(uint bits) { return uintBitsToFloat(bits << 16u); }
+
+// Round f32 -> bf16, round-to-nearest-even (same as torch.bfloat16()).
+float to_bf16(float v) {
+  uint f = floatBitsToUint(v);
+  f = f + 0x7FFFu + ((f >> 16u) & 1u);   // RNE: half-ulp bias + lsb
+  return uintBitsToFloat(f & 0xFFFF0000u);
+}
+
+void main() {
+  uint n = gl_WorkGroupID.x, t = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+  if (n >= p.N || t >= p.T) return;
+  float accA = 0.0, accB = 0.0;
+  uint wb = n * p.rowstride, xo = t * p.K;
+  // stream A: k = tid + 128m; stream B: k = tid + 64 + 128m; within a
+  // stream the block phase and in-block byte never move.
+  uint bA = wb + (tid >> 5) * 34u;
+  uint cA = bA + 2u + (tid & 31u);
+  uint qdA = bA >> 2u, cdA = cA >> 2u;
+  uint shdA = (bA & 3u) * 8u, shcA = (cA & 3u) * 8u;
+  uint xpA = xo + tid, kA = tid;
+  uint kb0 = tid + 64u;
+  uint bB = wb + (kb0 >> 5) * 34u;
+  uint cB = bB + 2u + (kb0 & 31u);
+  uint qdB = bB >> 2u, cdB = cB >> 2u;
+  uint shdB = (bB & 3u) * 8u, shcB = (cB & 3u) * 8u;
+  uint xpB = xo + kb0, kB = kb0;
+  uint iters = (p.K + 127u) >> 7;
+  if ((p.K & 127u) == 0u) {
+    // guard-free: k = tid + 128m (tid < 128) < 128 + 128*(iters-1) = K
+    for (uint m = 0u; m < iters; ++m) {
+      uint wd = (Q[qdA] >> shdA) & 0xFFFFu;
+      uint q8 = (Q[cdA] >> shcA) & 0xFFu;
+      float d = float(unpackHalf2x16(wd).x);
+      accA = fma(X[xpA], to_bf16(float(int(q8 ^ 0x80u) - 128) * d), accA);
+      wd = (Q[qdB] >> shdB) & 0xFFFFu;
+      q8 = (Q[cdB] >> shcB) & 0xFFu;
+      d = float(unpackHalf2x16(wd).x);
+      accB = fma(X[xpB], to_bf16(float(int(q8 ^ 0x80u) - 128) * d), accB);
+      qdA += 34u; cdA += 34u; xpA += 128u;
+      qdB += 34u; cdB += 34u; xpB += 128u;
+    }
+  } else {
+    for (uint m = 0u; m < iters; ++m) {
+      if (kA < p.K) {
+        uint wd = (Q[qdA] >> shdA) & 0xFFFFu;
+        uint q8 = (Q[cdA] >> shcA) & 0xFFu;
+        float d = float(unpackHalf2x16(wd).x);
+        accA = fma(X[xpA], to_bf16(float(int(q8 ^ 0x80u) - 128) * d), accA);
+      }
+      if (kB < p.K) {
+        uint wd = (Q[qdB] >> shdB) & 0xFFFFu;
+        uint q8 = (Q[cdB] >> shcB) & 0xFFu;
+        float d = float(unpackHalf2x16(wd).x);
+        accB = fma(X[xpB], to_bf16(float(int(q8 ^ 0x80u) - 128) * d), accB);
+      }
+      qdA += 34u; cdA += 34u; xpA += 128u; kA += 128u;
+      qdB += 34u; cdB += 34u; xpB += 128u; kB += 128u;
+    }
+  }
+  // Baseline level s=64 (sums[t] += sums[t+64]) is stream A += stream B
+  // in this lane; levels s=32..1 are the 64-wide XOR butterfly.
+  float acc = accA + accB;
+  for (uint s = 32u; s > 0u; s >>= 1u)
+    acc += subgroupShuffleXor(acc, s);
+  if (tid == 0u)
+    Y[t * p.N + n] = acc + (p.use_bias != 0u ? bf16(uint(B[n])) : 0.0);
+}

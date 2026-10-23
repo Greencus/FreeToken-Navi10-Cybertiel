@@ -21,6 +21,7 @@ host LRU ``DequantCache``; the VRAM LRU lives in the decoder.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 from typing import Any
 
@@ -34,7 +35,7 @@ from freetoken.models.gguf.dequant import (
     dequant_matrix,
     torch_shape,
 )
-from freetoken.models.gguf.packed import kquant_qtype, packed_expert
+from freetoken.models.gguf.packed import kquant_qtype, packed_expert, packed_view_tensor
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index, load_gguf_metadata
 from freetoken.models.gguf.tensors import float_tensor
 from freetoken.third_party.gguf import GGMLQuantizationType
@@ -46,6 +47,26 @@ from .config import Qwen35MoeConfig
 # (bounds the fp32 transient; lm_head/token_embd are ~515 MB packed each).
 _CHUNK_BYTES = 64 * 1024 * 1024
 _CHUNK_ROWS = 32768
+
+# FTV_DENSE_Q80: translated engine leaf -> (file leaf, gather kind).
+# "row" = identity (zero-copy mmap view); "qkv"/"z" = the provider's GDN
+# transform is a pure row permutation -> byte-row gather; "out" = the
+# provider's out_proj is an hv-tile column permutation, block-aligned ->
+# per-row block-group regather.  Everything else stays a BF16 pin.
+_PACKABLE_Q80 = {
+    "self_attn.q_proj.weight": ("attn_q", "row"),
+    "self_attn.o_proj.weight": ("attn_output", "row"),
+    "mlp.shared_expert.gate_proj.weight": ("ffn_gate_shexp", "row"),
+    "mlp.shared_expert.up_proj.weight": ("ffn_up_shexp", "row"),
+    "mlp.shared_expert.down_proj.weight": ("ffn_down_shexp", "row"),
+    "linear_attn.in_proj_qkv.weight": ("attn_qkv", "qkv"),
+    "linear_attn.in_proj_z.weight": ("attn_gate", "z"),
+    "linear_attn.out_proj.weight": ("ssm_out", "out"),
+}
+
+
+def _packed_verify_enabled() -> bool:
+    return os.environ.get("FTV_DENSE_Q80_VERIFY", "0").strip() != "0"
 
 _FLOAT_DTYPES = {
     int(GGMLQuantizationType.F32): torch.float32,
@@ -382,6 +403,128 @@ class GgufWeightProvider:
             r1 = min(rows_total, r0 + _CHUNK_ROWS)
             out[r0:r1] = _dequant_rows(info, r0, r1).to(dtype)
         return out
+
+    # -- FTV_DENSE_Q80: the file's OWN Q8_0 bytes ------------------------
+    def packed_matrix(
+        self, info: GgufTensorInfo
+    ) -> tuple[torch.Tensor, int] | None:
+        """The file's raw Q8_0 slab as ``(rows, row_bytes)`` uint8 + K.
+
+        Zero-copy view of the mmap for identity stems (the GEMV then
+        reads the file-exact weights - MORE faithful than the dequant ->
+        BF16-rounded copy - at 1.0625 B/weight instead of 2).  Returns
+        None when the tensor is not Q8_0 or K is not a whole number of
+        32-value blocks: the caller falls back to the BF16 pin.
+        """
+        if int(info.ggml_type) != int(GGMLQuantizationType.Q8_0):
+            return None
+        k = int(info.ne[0])
+        if k % 32:
+            return None
+        rows = int(np.prod(info.ne[1:]))
+        rb = (k // 32) * 34
+        slab = np.frombuffer(info.data(), dtype=np.uint8, count=rows * rb)
+        return packed_view_tensor(slab.reshape(rows, rb)), k
+
+    def get_packed(self, name: str) -> tuple[torch.Tensor, int] | None:
+        """Packed Q8_0 bytes for a translated engine name, or None.
+
+        None (-> plain BF16 pin) for tensors that are not Q8_0 in the
+        file (k/v are F16, norms/GDN params F32) and for the two GDN
+        stems whose provider transform is not identity: those are
+        gathered byte-exactly on the host (row/block moves only, no
+        dequant) so the pinned rows still match what the engine expects.
+        ``FTV_DENSE_Q80_VERIFY=1`` cross-checks the gathered rows against
+        the dequantized BF16 reference (gates; costs one dequant).
+        """
+        if name == "lm_head.weight":
+            leaf, kind = "output", "row"
+            blk = None
+        elif ".layers." in name:
+            marker = ".layers."
+            li = name.index(marker) + len(marker)
+            dot = name.index(".", li)
+            blk = f"blk.{int(name[li:dot])}"
+            leaf_map = _PACKABLE_Q80.get(name[dot + 1:])
+            if leaf_map is None:
+                return None
+            leaf, kind = leaf_map
+        else:
+            return None
+        info = self.index.get(f"{blk}.{leaf}.weight" if blk else f"{leaf}.weight")
+        if info is None:
+            return None
+        packed = self.packed_matrix(info)
+        if packed is None:
+            return None
+        slab, k = packed
+        rows = int(slab.shape[0])
+        nk, hv = self.config.linear_num_key_heads, self.config.linear_value_head_dim
+
+        if kind == "row":
+            out = slab
+        elif kind in ("qkv", "z"):
+            # provider: torch.cat([rows[:v_start], untile(rows[v_start:])])
+            # / untile(rows) - a pure ROW permutation, applied to the byte
+            # rows as an index gather (per-row bytes never change).
+            start = self._gdn_v_start if kind == "qkv" else 0
+            n = rows - start
+            r = n // (nk * hv)
+            # torch .view(r,nk,hv).transpose(0,1) == numpy .transpose(1,0,2)
+            # (numpy wants the full permutation, not a 2-dim swap).
+            idx = np.arange(n).reshape(r, nk, hv).transpose(1, 0, 2).reshape(-1)
+            perm = np.concatenate([np.arange(start), start + idx])
+            out = torch.from_numpy(np.take(slab.numpy(), perm, axis=0))
+        elif kind == "out":
+            # provider: w.index_select(1, cols) - a COLUMN permutation by
+            # hv-sized tiles, each tile a whole number of Q8_0 blocks, so
+            # regrouping 4-block units inside every byte row is exact.
+            cfg = self.config
+            nv = cfg.linear_num_value_heads
+            r = nv // nk
+            head = np.arange(nv)
+            tiled = (head % r) * nk + (head // r)
+            groups = (k // 32) // (hv // 32)          # hv-sized groups/row
+            assert groups == nv, (groups, nv, hv, k)
+            rb = (k // 32) * 34
+            gsz = (hv // 32) * 34
+            view = slab.reshape(rows, groups, gsz)
+            out = torch.from_numpy(
+                np.ascontiguousarray(view.numpy()[:, tiled, :]).reshape(rows, rb)
+            )
+        else:  # pragma: no cover - _PACKABLE_Q80 is closed
+            return None
+
+        if _packed_verify_enabled():
+            self._verify_packed(name, out, k)
+        return out, k
+
+    def _verify_packed(self, name: str, packed: torch.Tensor, k: int) -> None:
+        """Cross-check gathered Q8_0 rows against the BF16 pin reference."""
+        rows = packed.shape[0]
+        rb = packed.shape[1]
+        blocks = rb // 34
+        v = packed.reshape(rows, blocks, 34).numpy()
+        # numpy .view(dtype) only rewrites the LAST dim - reshape after.
+        d = v[..., 0:2].copy().view(np.uint16).view(np.float16).reshape(rows, blocks)
+        q = v[..., 2:34].copy().view(np.int8).reshape(rows, blocks, 32)
+        deq = (
+            torch.from_numpy(
+                (q.astype(np.float32) * d[..., None].astype(np.float32))
+            )
+            .reshape(rows, k)
+            .to(torch.bfloat16)
+        )
+        # _fetch, not get: the reference must not land in _cache - that
+        # would pin ~4 GB of host BF16 for the process (the packed path
+        # exists to not materialize those copies at all).
+        want = self._fetch(name)
+        if want is None or not torch.equal(deq, want.to(torch.bfloat16)):
+            diff = (deq.float() - want.float()).abs().max().item()
+            raise AssertionError(
+                f"FTV_DENSE_Q80_VERIFY: {name} packed rows differ from the "
+                f"dequant reference (maxdiff {diff:.3e})"
+            )
 
     # -- experts ----------------------------------------------------------
     def expert_bank(self, layer: int, proj: str) -> ExpertBank:

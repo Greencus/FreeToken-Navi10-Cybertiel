@@ -53,6 +53,11 @@ struct Context {
     uint32_t                   queue2_family    = UINT32_MAX;
     VkCommandPool              command_pool2    = VK_NULL_HANDLE;
     bool                       has_queue2       = false;
+    // VK_EXT_host_query_reset (probed at device creation): lets the batch
+    // timeline instrumentation reset its timestamp query pool from the host
+    // between batches instead of recording vkCmdResetQueryPool in every
+    // command buffer.  Absent -> the in-command reset fallback.
+    bool                       has_host_query_reset = false;
 };
 
 inline Context create_context() {
@@ -122,6 +127,27 @@ inline Context create_context() {
     v11.storageBuffer16BitAccess = VK_TRUE;
     v11.pNext = &v12;
 
+    // Optional device extensions.  Only VK_EXT_host_query_reset today
+    // (timestamp-pool resets between batches without touching the command
+    // buffer); absence is fine - the in-command vkCmdResetQueryPool
+    // fallback covers it.  Never enable anything not actually exposed.
+    std::vector<const char*> dev_exts;
+    {
+        uint32_t en = 0;
+        vkEnumerateDeviceExtensionProperties(ctx.physical_device, nullptr,
+                                             &en, nullptr);
+        std::vector<VkExtensionProperties> eps(en);
+        vkEnumerateDeviceExtensionProperties(ctx.physical_device, nullptr,
+                                             &en, eps.data());
+        for (const auto& e : eps) {
+            if (!std::strcmp(e.extensionName,
+                             VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME)) {
+                dev_exts.push_back(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME);
+                ctx.has_host_query_reset = true;
+            }
+        }
+    }
+
     // Logical device + queues (main + optional second family).
     float qprio = 1.0f;
     VkDeviceQueueCreateInfo qcis[2]{};
@@ -140,6 +166,8 @@ inline Context create_context() {
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = nqci;
     dci.pQueueCreateInfos = qcis;
+    dci.enabledExtensionCount = (uint32_t)dev_exts.size();
+    dci.ppEnabledExtensionNames = dev_exts.data();
     dci.pNext = &v11;   // enable the fp16 + 16bit-storage features
     VKU_CHECK(vkCreateDevice(ctx.physical_device, &dci, nullptr, &ctx.device));
     vkGetDeviceQueue(ctx.device, ctx.queue_family, 0, &ctx.queue);

@@ -1,0 +1,76 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+// Q8_0 GEMV over the GGUF file's OWN packed bytes (FTV_Q80_GGUF_VARIANT=
+// tp): pt's slim fetch + fast reduce, software-pipelined - iteration m
+// fetches segment m+1 while fmaring m, hiding the gather's load latency
+// behind the previous element's chain.  Each stream's fma sequence stays
+// ascending (only the fetch moves earlier), so every output bit matches
+// ref; 2 loads per element.
+layout(local_size_x=128) in;
+layout(std430,binding=0) readonly buffer QBuf { uint Q[]; };
+layout(std430,binding=1) readonly buffer BBuf { uint16_t B[]; };
+layout(std430,binding=2) readonly buffer XBuf { float X[]; };
+layout(std430,binding=3) writeonly buffer YBuf { float Y[]; };
+layout(push_constant) uniform P {
+    uint T; uint N; uint K; uint use_bias; uint rowstride;
+} p;
+shared float sums[128];
+
+float bf16(uint bits) { return uintBitsToFloat(bits << 16u); }
+
+// Round f32 -> bf16, round-to-nearest-even (same as torch.bfloat16()).
+float to_bf16(float v) {
+  uint f = floatBitsToUint(v);
+  f = f + 0x7FFFu + ((f >> 16u) & 1u);   // RNE: half-ulp bias + lsb
+  return uintBitsToFloat(f & 0xFFFF0000u);
+}
+
+void main() {
+  uint n = gl_WorkGroupID.x, t = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+  if (n >= p.N || t >= p.T) return;
+  float acc = 0.0;
+  uint wb = n * p.rowstride, xo = t * p.K;
+  // current segment (fetched out of band) + lookahead slot
+  float dc = 0.0, dn = 0.0;
+  int qc = 0, qn = 0;
+  bool hc = false, hn = false;
+  uint kc = tid, kn = 0u;
+  // prologue: fetch iteration 0
+  hc = kc < p.K;
+  if (hc) {
+    uint bs = wb + (kc >> 5u) * 34u;
+    uint wd = (Q[bs >> 2u] >> ((bs & 3u) * 8u)) & 0xFFFFu;
+    uint ca = bs + 2u + (kc & 31u);
+    uint q8 = (Q[ca >> 2u] >> ((ca & 3u) * 8u)) & 0xFFu;
+    dc = float(unpackHalf2x16(wd).x);
+    qc = q8 >= 0x80u ? int(q8) - 256 : int(q8);
+  }
+  for (uint m = 0u; (m << 7u) < p.K; ++m) {
+    // fetch segment m+1 into dn/qn while we fmare segment m
+    kn = kc + 128u;
+    hn = kn < p.K;
+    if (hn) {
+      uint bs = wb + (kn >> 5u) * 34u;
+      uint wd = (Q[bs >> 2u] >> ((bs & 3u) * 8u)) & 0xFFFFu;
+      uint ca = bs + 2u + (kn & 31u);
+      uint q8 = (Q[ca >> 2u] >> ((ca & 3u) * 8u)) & 0xFFu;
+      dn = float(unpackHalf2x16(wd).x);
+      qn = q8 >= 0x80u ? int(q8) - 256 : int(q8);
+    }
+    if (hc)
+      acc = fma(X[xo + kc], to_bf16(float(qc) * dc), acc);
+    kc = kn; dc = dn; qc = qn; hc = hn;
+  }
+  sums[tid] = acc;
+  barrier();
+  if (tid < 64u) {
+    acc = acc + sums[tid + 64u];                // level s=64 (cross-wave)
+    for (uint s = 32u; s > 0u; s >>= 1u)
+      acc += subgroupShuffleXor(acc, s);        // levels s=32..1
+    if (tid == 0u)
+      Y[t * p.N + n] = acc + (p.use_bias != 0u ? bf16(uint(B[n])) : 0.0);
+  }
+}
